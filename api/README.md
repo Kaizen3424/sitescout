@@ -4,6 +4,8 @@ TypeScript HTTP API around the same pipeline as the Python CLI. Runs as one
 Vercel Function. Personal, open-source, non-commercial project, so it fits
 Vercel's free Hobby plan.
 
+**Deployed at:** <https://sitescout-dusky.vercel.app> — `main` auto-deploys.
+
 ## Endpoints
 
 ### `POST /v1/analyze`
@@ -42,6 +44,11 @@ the same field names as the CLI's `report.json`:
 A failing URL returns `UNSCORED` or `SITE_DOWN` with a reason; it never fails the
 whole batch. Status codes: `400` bad body, `401` bad token, `404` unknown path,
 `405` wrong method, `500` missing configuration.
+
+An unknown path is answered by Vercel's own `404` page, so its body is HTML
+rather than JSON. A request that runs out of its time budget still answers with
+`200` and JSON: URLs that did not finish carry `deadline_exceeded: true` and a
+reason. Send them again in a smaller batch.
 
 ### `GET /health`
 
@@ -100,6 +107,9 @@ Prefer the key-value file for other tools: `vercel env pull .env.local`.
 
 - Vercel Hobby: 300 s per request, 512 MB–2 GB memory, 1 M invocations/month.
   5 URLs at 3-way concurrency normally finishes in 60–150 s.
+- The internal budget stops at 270 s (configurable, clamped to 280 s) and aborts
+  in-flight work, so a slow batch always answers with JSON inside Vercel's 300 s
+  limit instead of being killed with an HTML 504.
 - Runtime Cache items are capped at 2 MB, so screenshots are not cached. Gemini
   answers are cached for 72 h, keyed by the page's HTML content, so re-running an
   unchanged page spends Firecrawl credits but no Gemini quota.

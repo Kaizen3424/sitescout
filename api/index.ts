@@ -58,6 +58,17 @@ async function mapLimit<T, R>(
   return results;
 }
 
+/** Placeholder report for a URL the request budget did not reach. */
+function budgetReport(url: string): Report {
+  const report = baseReport(url);
+  report.reasons.push(
+    "The request time budget was exhausted before this URL could be analysed. " +
+      "Send it in its own request (a screenshot of a very tall page can take longer).",
+  );
+  report.deadline_exceeded = true;
+  return report;
+}
+
 function health(): Response {
   try {
     const runtime = getRuntime();
@@ -184,26 +195,30 @@ export default {
     }
 
     const deadline = started + runtime.settings.requestDeadlineMs;
+    // Abort everything still in flight when the budget runs out, so the batch
+    // unwinds and answers with partial results instead of being killed by the
+    // platform (which would return an HTML 504, not JSON).
+    const budget = new AbortController();
+    const budgetTimer = setTimeout(() => budget.abort(), runtime.settings.requestDeadlineMs);
+    const signal = AbortSignal.any([request.signal, budget.signal]);
+
     const deps = {
       settings: runtime.settings,
       firecrawl: runtime.firecrawl,
       gemini: runtime.gemini,
     };
 
+    // Prefilled placeholders: whatever is still unfinished when the hard stop
+    // fires keeps its "budget exhausted" report.
+    const results: Report[] = parsed.urls.map((raw) => budgetReport(raw));
     let fatal: string | null = null;
-    const results: Report[] = await mapLimit(parsed.urls, runtime.settings.concurrency, async (raw) => {
-      if (Date.now() >= deadline) {
-        const report = baseReport(raw);
-        report.reasons.push(
-          "The request time budget was exhausted before this URL could be analysed. " +
-            "Send it in its own request.",
-        );
-        return report;
-      }
+
+    const work = mapLimit(parsed.urls, runtime.settings.concurrency, async (raw, index) => {
+      if (Date.now() >= deadline) return;
       try {
-        return await analyzeUrl(raw, deps, {
+        results[index] = await analyzeUrl(raw, deps, {
           fresh: parsed.fresh,
-          signal: request.signal,
+          signal,
           deadline,
         });
       } catch (err) {
@@ -213,9 +228,29 @@ export default {
         } else if (!(err instanceof FatalApiError)) {
           console.error(`unexpected error for ${raw}`, err);
         }
-        return failedReport(raw, err);
+        results[index] = failedReport(raw, err);
       }
+    }).catch((err: unknown) => {
+      // A worker crashed in a way the per-URL handler did not see: keep the
+      // placeholders rather than failing the whole batch.
+      console.error("analyse worker crashed", err);
     });
+
+    // Belt and braces: if a worker somehow ignores the abort, answer anyway
+    // while there is still time left before Vercel's 300 s limit.
+    let hardTimer: ReturnType<typeof setTimeout> | undefined;
+    const hardStop = new Promise<void>((resolve) => {
+      hardTimer = setTimeout(
+        resolve,
+        Math.min(runtime.settings.requestDeadlineMs + 15_000, 292_000),
+      );
+    });
+    try {
+      await Promise.race([work, hardStop]);
+    } finally {
+      clearTimeout(hardTimer);
+      clearTimeout(budgetTimer);
+    }
 
     return json({
       ok: true,

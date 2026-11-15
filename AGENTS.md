@@ -14,6 +14,10 @@ That is what allows the API to run on Vercel's free Hobby plan.
 The CLI is the reference implementation. The API must produce the same verdicts
 and the same report field names.
 
+**Production API:** https://sitescout-dusky.vercel.app
+(`GET /health`, `POST /v1/analyze`, `GET /`). Deployed from the `main` branch of
+`https://github.com/Kaizen3424/sitescout` — pushing to `main` redeploys it.
+
 ## Rules that must not be broken
 
 - **One full-page screenshot, untouched.** No crop, no resize, no upload budget in
@@ -34,6 +38,16 @@ python sitescout.py https://example.com     # CLI, one site
 npx tsc --noEmit                            # type-check the API
 vercel dev                                  # API locally (needs vercel login/link)
 vercel --prod                               # deploy the API
+```
+
+Testing production (token is in `.env.local`):
+
+```powershell
+curl.exe -s https://sitescout-dusky.vercel.app/health
+curl.exe -s -X POST https://sitescout-dusky.vercel.app/v1/analyze `
+  -H "Authorization: Bearer $env:SITESCOUT_API_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{"urls":["arngren.net"]}'
 ```
 
 ## Layout

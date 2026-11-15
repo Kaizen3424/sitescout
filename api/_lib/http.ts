@@ -24,7 +24,19 @@ export interface KeyedOptions extends RetryOptions {
   maxKeyWaitMs?: number;
 }
 
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+/**
+ * Waits, but never past the request deadline. A retry that could only happen
+ * after the deadline is pointless, and sleeping through it would let the
+ * function run into the platform's hard timeout and return an HTML 504
+ * instead of a JSON report.
+ */
+function sleep(ms: number, signal?: AbortSignal, deadline?: number): Promise<void> {
+  if (deadline !== undefined) {
+    const left = deadline - Date.now();
+    if (left <= 0 || ms >= left) {
+      return Promise.reject(new DeadlineError("request time budget exhausted"));
+    }
+  }
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
       reject(new DeadlineError("request aborted"));
@@ -40,6 +52,11 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
     }, Math.max(1, ms));
     signal?.addEventListener("abort", onAbort, { once: true });
   });
+}
+
+/** Milliseconds left before the deadline, or Infinity when there is none. */
+function timeLeft(deadline?: number): number {
+  return deadline === undefined ? Infinity : Math.max(0, deadline - Date.now());
 }
 
 function retryAfterMs(res: Response): number | null {
@@ -112,14 +129,14 @@ export async function fetchWithRetry(
       const wait = retryAfterMs(res) ?? backoffMs(attempt, opts.backoff);
       console.warn(`${opts.label}: HTTP ${res.status} (attempt ${attempt}/${attempts}) - retrying in ${Math.round(wait)}ms`);
       await discardBody(res);
-      await sleep(wait, opts.signal);
+      await sleep(wait, opts.signal, opts.deadline);
     } catch (err) {
       if (err instanceof DeadlineError) throw err;
       lastError = err instanceof Error ? err : new Error(String(err));
       if (attempt === attempts) break;
       const wait = backoffMs(attempt, opts.backoff);
       console.warn(`${opts.label}: ${lastError.message} (attempt ${attempt}/${attempts}) - retrying in ${Math.round(wait)}ms`);
-      await sleep(wait, opts.signal);
+      await sleep(wait, opts.signal, opts.deadline);
     }
   }
   if (lastResponse) return lastResponse;
@@ -158,13 +175,15 @@ export async function fetchWithKeys(url: string, opts: KeyedOptions): Promise<Re
       }
       const wait = opts.pool.msUntilReady();
       if (wait === null) throw new FatalApiError(`All ${opts.pool.name} API keys are unusable.`);
-      if (waited + wait > maxKeyWait) {
+      // Never plan to wait beyond what is left of the request budget.
+      const waitCap = Math.min(maxKeyWait, timeLeft(opts.deadline));
+      if (waited + wait > waitCap) {
         if (lastResponse) return lastResponse;
         throw new NetworkError(`${opts.label}: all API keys are rate-limited`);
       }
       if (wait > 0) {
         console.warn(`${opts.label}: all keys cooling down - waiting ${Math.round(wait / 1000)}s`);
-        await sleep(wait + 1000, opts.signal);
+        await sleep(wait + 1000, opts.signal, opts.deadline);
         waited += wait + 1000;
       }
       tried.clear();
@@ -190,7 +209,7 @@ export async function fetchWithKeys(url: string, opts: KeyedOptions): Promise<Re
         console.warn(
           `${tag}: ${lastError.message} (attempt ${attempt}/${attempts}) - retrying in ${Math.round(wait)}ms`,
         );
-        await sleep(wait, opts.signal);
+        await sleep(wait, opts.signal, opts.deadline);
         continue;
       }
 
@@ -221,7 +240,7 @@ export async function fetchWithKeys(url: string, opts: KeyedOptions): Promise<Re
       const wait = retryAfterMs(res) ?? backoffMs(attempt, opts.backoff);
       console.warn(`${tag}: HTTP ${res.status} (attempt ${attempt}/${attempts}) - retrying in ${Math.round(wait)}ms`);
       await discardBody(res);
-      await sleep(wait, opts.signal);
+      await sleep(wait, opts.signal, opts.deadline);
     }
   }
 }

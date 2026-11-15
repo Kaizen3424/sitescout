@@ -97,7 +97,12 @@ export function loadSettings(): Settings {
     decisionCacheTtlHours: envNumber("SITESCOUT_DECISION_CACHE_TTL_HOURS", 72),
     maxUrls: Math.max(1, Math.min(envNumber("SITESCOUT_MAX_URLS", 5), 10)),
     concurrency: Math.max(1, Math.min(envNumber("SITESCOUT_CONCURRENCY", 3), 5)),
-    requestDeadlineMs: envNumber("SITESCOUT_REQUEST_DEADLINE_MS", 270_000),
+    // Vercel Hobby kills a request at 300 s, so the internal budget stays below
+    // that no matter what the environment says.
+    requestDeadlineMs: Math.max(
+      5_000,
+      Math.min(envNumber("SITESCOUT_REQUEST_DEADLINE_MS", 270_000), 280_000),
+    ),
     // Google's inline limit is 20 MB; stay just below it instead of shrinking anything.
     maxImageBytes: envNumber("SITESCOUT_MAX_IMAGE_BYTES", 18 * 1024 * 1024),
   };
