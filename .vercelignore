@@ -1,0 +1,17 @@
+# Python CLI and its local files are not part of the API deployment.
+*.py
+*.pyc
+__pycache__/
+*.bak
+report.json
+urls.txt
+
+# Secrets and local state
+.env
+.env.local
+.vercel/
+node_modules/
+
+# Unrelated folders
+Webshops/
+.pytest_cache/

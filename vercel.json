@@ -1,0 +1,22 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "api/index.ts": {
+      "maxDuration": 300
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/",
+      "destination": "/api?__route=root"
+    },
+    {
+      "source": "/health",
+      "destination": "/api?__route=health"
+    },
+    {
+      "source": "/v1/analyze",
+      "destination": "/api?__route=analyze"
+    }
+  ]
+}
