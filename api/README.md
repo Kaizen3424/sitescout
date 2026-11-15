@@ -1,12 +1,29 @@
 # SiteScout API
 
-TypeScript HTTP API around the same pipeline as the Python CLI. Runs as one
-Vercel Function. Personal, open-source, non-commercial project, so it fits
-Vercel's free Hobby plan.
+TypeScript HTTP API around the same pipeline as the Python CLI, plus the public
+batch interface in [`web/`](../web). Runs as one Vercel Function. Personal,
+open-source, non-commercial project, so it fits Vercel's free Hobby plan.
 
 **Deployed at:** <https://sitescout-dusky.vercel.app> — `main` auto-deploys.
+The batch interface is the site root; the JSON index moved to `/v1` because `/`
+now serves a page.
+
+## Two ways to analyse
+
+| Endpoint | Wait for the answer? | Limit | Auth |
+|----------|----------------------|-------|------|
+| `POST /v1/analyze` | Yes, inside the request | 5 URLs | Bearer token |
+| `POST /v1/jobs` | No, it runs in the background | 50 URLs | None (rate-limited) |
+
+The web page uses only `/v1/jobs`, so a batch survives a closed tab, a closed
+browser or a phone that lost its connection.
 
 ## Endpoints
+
+### `GET /v1`
+
+No auth. Name, version and a list of the endpoints below. `/` serves the web
+interface instead of JSON.
 
 ### `POST /v1/analyze`
 
@@ -45,15 +62,127 @@ A failing URL returns `UNSCORED` or `SITE_DOWN` with a reason; it never fails th
 whole batch. Status codes: `400` bad body, `401` bad token, `404` unknown path,
 `405` wrong method, `500` missing configuration.
 
-An unknown path is answered by Vercel's own `404` page, so its body is HTML
-rather than JSON. A request that runs out of its time budget still answers with
-`200` and JSON: URLs that did not finish carry `deadline_exceeded: true` and a
-reason. Send them again in a smaller batch.
+A request that runs out of its time budget still answers with `200` and JSON:
+URLs that did not finish carry `deadline_exceeded: true` and a reason. Send them
+again in a smaller batch.
+
+### `POST /v1/jobs`
+
+No token. It is the public form, so the door is guarded by counters instead of
+a login: a few batches per address per hour and a daily ceiling on URLs (see
+[Limits](#limits-and-quotas)).
+
+```json
+{ "urls": ["arngren.net", "funda.nl"], "fresh": false }
+```
+
+`urls` accepts 1–50 entries, deduplicated and normalised (a missing `https://`
+is added). `fresh` behaves as it does for `/v1/analyze`.
+
+`201` with the new batch:
+
+```json
+{
+  "ok": true,
+  "dispatched": true,
+  "job": {
+    "id": "Rw5c_3o4j3geFU741_nl0A",
+    "createdAt": "2026-11-15T09:47:02.186Z",
+    "urls": ["https://arngren.net"],
+    "total": 1,
+    "fresh": false,
+    "status": "queued",
+    "done": 0,
+    "results": [],
+    "totals": {},
+    "elapsed_s": 0,
+    "canRetry": true,
+    "ttlDays": 30
+  }
+}
+```
+
+The id is 22 URL-safe characters from 16 random bytes: unguessable, and the only
+key to the batch. Anyone holding the link can read the reports, so treat it as a
+private link.
+
+If the batch is saved but the queue cannot be reached, the answer is still `201`
+with `"dispatched": false` and a `warning`; `POST /v1/jobs/:id/retry` sends the
+missing work later.
+
+Errors: `400` bad body / more than 50 URLs / an address that cannot be used,
+`429` rate limit (`retry_after_s` says when to try again), `500` missing
+configuration.
+
+### `GET /v1/jobs/:id`
+
+No auth. Current progress and every finished report:
+
+```json
+{
+  "ok": true,
+  "job": {
+    "id": "Rw5c_3o4j3geFU741_nl0A",
+    "status": "running",
+    "total": 12,
+    "done": 5,
+    "results": [{ "input_url": "https://arngren.net", "verdict": "REACH_OUT" }],
+    "totals": { "REACH_OUT": 4, "MAYBE": 1 },
+    "elapsed_s": 184.2,
+    "canRetry": true,
+    "ttlDays": 30
+  }
+}
+```
+
+`status` is `queued`, `running`, `completed` or `failed`. `results` only holds
+finished URLs, in the order they were submitted, so a poller can grow the list
+without re-fetching earlier work. `404` once the batch is older than the TTL.
+
+### `POST /v1/jobs/:id/retry`
+
+No auth. Queues the URLs that still have no report and returns the batch like
+`GET /v1/jobs/:id` with a `dispatched` count. `429` once the automatic restart
+budget is used up; start a new batch instead. A completed batch is a no-op.
+
+### `GET /v1/jobs/:id/report.json`
+
+No auth. Downloads the finished reports as a plain JSON array — exactly the
+shape of the CLI's `report.json` — with
+`Content-Disposition: attachment; filename="sitescout-<id>.json"`.
 
 ### `GET /health`
 
 No token. Returns key counts (never key values), model name and request limits,
 or `503` when configuration is incomplete.
+
+## How a batch runs
+
+1. `POST /v1/jobs` checks the quota counters, normalises the URLs and writes one
+   Redis hash: `ss:job:<id>`.
+2. It publishes **one QStash message per URL** to `POST /v1/jobs/run`
+   (flow-control key `sitescout-jobs`, parallelism from
+   `SITESCOUT_JOB_CONCURRENCY`). QStash retries twice and gives the function up
+   to 280 s.
+3. `POST /v1/jobs/run` verifies the QStash signature, analyses **one** URL and
+   writes its report to `ss:job:<id>:r`. A URL that already has a report is
+   skipped, so a redelivery is harmless.
+4. When the last report lands, the hash is marked `completed`. Both keys get the
+   same TTL (30 days by default), so batches clean themselves up.
+
+That one-message-per-URL design is what makes a closed tab irrelevant: nothing
+in the browser is doing the work.
+
+## Redis layout
+
+| Key | Type | Contents |
+|-----|------|----------|
+| `ss:job:<id>` | hash | `createdAt`, `urls`, `total`, `fresh`, `status`, `dispatches`, `completedAt`, `error` |
+| `ss:job:<id>:r` | hash | field `"<index>"` → JSON report |
+| `ss:rate:job:<ip-hash>:<hour>` | counter | batches per address per hour |
+| `ss:rate:urls:<date>` | counter | URLs analysed today (UTC) |
+
+Addresses are stored as a 16-character SHA-256 prefix, never raw.
 
 ## Environment variables
 
@@ -61,15 +190,28 @@ or `503` when configuration is incomplete.
 |----------|----------|---------|---------|
 | `FIRECRAWL_API_KEYS` | yes | — | One or more keys, comma-separated. |
 | `GEMINI_API_KEYS` | yes | — | One or more keys, comma-separated. |
-| `SITESCOUT_API_TOKEN` | yes | — | Bearer token clients must send. |
-| `SITESCOUT_MAX_URLS` | no | `5` | URLs per request (max 10). |
-| `SITESCOUT_CONCURRENCY` | no | `3` | URLs analysed in parallel. |
+| `SITESCOUT_API_TOKEN` | `/v1/analyze` | — | Bearer token clients must send. |
+| `SITESCOUT_MAX_URLS` | no | `5` | URLs per `/v1/analyze` request (max 10). |
+| `SITESCOUT_CONCURRENCY` | no | `3` | URLs analysed in parallel per request. |
 | `SITESCOUT_MODEL` | no | `gemini-decision-1` | Decisions model. |
 | `SITESCOUT_IMAGE_RESOLUTION` | no | `high` | Gemini's own image setting (`low`/`medium`/`high`/`ultra_high`). |
 | `SITESCOUT_REACH_OUT_THRESHOLD` | no | `0.60` | Verdict threshold. |
 | `SITESCOUT_MAYBE_THRESHOLD` | no | `0.40` | Verdict threshold. |
 | `SITESCOUT_REQUEST_DEADLINE_MS` | no | `270000` | Internal stop before Vercel's 300 s limit. |
 | `SITESCOUT_MAX_IMAGE_BYTES` | no | `18874368` | Safety stop below Google's 20 MB inline limit. |
+| `UPSTASH_REDIS_REST_URL` | jobs | — | Upstash Redis REST URL (`KV_REST_API_URL` also works). |
+| `UPSTASH_REDIS_REST_TOKEN` | jobs | — | Upstash Redis REST token (`KV_REST_API_TOKEN` also works). |
+| `QSTASH_TOKEN` | jobs | — | QStash publish token. |
+| `QSTASH_URL` | no | `https://qstash.upstash.io` | Set for a non-default region, e.g. `https://qstash-eu-central-1.upstash.io`. |
+| `QSTASH_CURRENT_SIGNING_KEY` | jobs | — | Verifies callbacks. |
+| `QSTASH_NEXT_SIGNING_KEY` | jobs | — | Verifies callbacks during a key rotation. |
+| `SITESCOUT_PUBLIC_ORIGIN` | no | Vercel URL | Public origin QStash calls back to (custom domain, local tunnel). |
+| `SITESCOUT_MAX_JOB_URLS` | no | `50` | URLs per batch (max 50). |
+| `SITESCOUT_JOB_TTL_DAYS` | no | `30` | How long a batch stays readable. |
+| `SITESCOUT_JOB_CONCURRENCY` | no | `5` | How many URLs one deployment analyses at once (max 10). |
+| `SITESCOUT_JOBS_PER_HOUR` | no | `8` | Batches per address per hour. |
+| `SITESCOUT_DAILY_URL_BUDGET` | no | `500` | URLs per day across everyone (UTC). |
+| `SITESCOUT_JOBS_INLINE` | no | off | Development only: run the batch inside the request, no QStash. |
 
 The image itself is **never** cropped, resized or recompressed. The size in the
 report is the full-page capture from Firecrawl.
@@ -80,10 +222,25 @@ report is the full-page capture from Firecrawl.
 npm install
 vercel login
 vercel link          # create/link the project
-vercel dev           # downloads Development env vars automatically
+vercel env pull .env.local
+vercel dev           # http://localhost:3000
 ```
 
-Then call it:
+Serve the page with the API for a real end-to-end test:
+
+```powershell
+$env:SITESCOUT_JOBS_INLINE = "1"     # analyse inside the request, no public callback
+vercel dev
+```
+
+`SITESCOUT_JOBS_INLINE=1` skips QStash entirely, so no public URL is needed and
+the POST returns when the whole batch is done. Keep test batches to one or two
+URLs: the request still has Vercel's time budget.
+
+The page itself is static (`web/index.html`, `web/styles.css`, `web/app.js`);
+`vercel.json` maps `/` and `/j/:id` to it.
+
+Call the token endpoint:
 
 ```powershell
 curl.exe -X POST http://localhost:3000/v1/analyze `
@@ -92,24 +249,36 @@ curl.exe -X POST http://localhost:3000/v1/analyze `
   -d '{"urls":["arngren.net"]}'
 ```
 
-Prefer the key-value file for other tools: `vercel env pull .env.local`.
-
 ## Deploy
 
 1. Create a free account at <https://vercel.com>.
 2. `npm i -g vercel`, then in the repo root: `vercel login` and `vercel link`.
-3. In the dashboard: **Project → Settings → Environment Variables** and add
-   `FIRECRAWL_API_KEYS`, `GEMINI_API_KEYS`, `SITESCOUT_API_TOKEN` for
-   **Production** and **Preview**.
-4. `vercel --prod`.
+3. Create the two Upstash resources on their free plan and copy the credentials
+   into **Project → Settings → Environment Variables** for **Production** and
+   **Preview**:
+   - Redis: `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`
+   - QStash: `QSTASH_TOKEN`, `QSTASH_CURRENT_SIGNING_KEY`,
+     `QSTASH_NEXT_SIGNING_KEY`, and `QSTASH_URL` if the region is not the
+     default.
+4. Add `FIRECRAWL_API_KEYS`, `GEMINI_API_KEYS` and `SITESCOUT_API_TOKEN` the same
+   way.
+5. `vercel --prod`.
 
-## Notes and limits
+No cron job is involved: QStash delivers the work, so Hobby's once-a-day cron
+limit does not matter.
+
+## Limits and quotas
 
 - Vercel Hobby: 300 s per request, 512 MB–2 GB memory, 1 M invocations/month.
-  5 URLs at 3-way concurrency normally finishes in 60–150 s.
 - The internal budget stops at 270 s (configurable, clamped to 280 s) and aborts
   in-flight work, so a slow batch always answers with JSON inside Vercel's 300 s
   limit instead of being killed with an HTML 504.
+- QStash free plan: 1,000 messages/day, 10 parallel deliveries, 15 min per
+  delivery. One message is one URL, so 50 URLs cost 50 messages.
+- Upstash Redis free plan: 250 MB, 500K commands/month, persistence on.
+- The default daily ceiling in code is 500 URLs, comfortably inside both free
+  tiers. `SITESCOUT_JOBS_PER_HOUR=8` stops one visitor from spending the day's
+  budget with a script.
 - Runtime Cache items are capped at 2 MB, so screenshots are not cached. Gemini
   answers are cached for 72 h, keyed by the page's HTML content, so re-running an
   unchanged page spends Firecrawl credits but no Gemini quota.

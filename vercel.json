@@ -7,16 +7,44 @@
   },
   "rewrites": [
     {
-      "source": "/",
-      "destination": "/api?__route=root"
-    },
-    {
       "source": "/health",
       "destination": "/api?__route=health"
     },
     {
+      "source": "/v1",
+      "destination": "/api?__route=api"
+    },
+    {
       "source": "/v1/analyze",
       "destination": "/api?__route=analyze"
+    },
+    {
+      "source": "/v1/jobs",
+      "destination": "/api?__route=jobs"
+    },
+    {
+      "source": "/v1/jobs/run",
+      "destination": "/api?__route=job_run"
+    },
+    {
+      "source": "/v1/jobs/:id/retry",
+      "destination": "/api?__route=job_retry&jobId=:id"
+    },
+    {
+      "source": "/v1/jobs/:id/report.json",
+      "destination": "/api?__route=job_report&jobId=:id"
+    },
+    {
+      "source": "/v1/jobs/:id",
+      "destination": "/api?__route=job&jobId=:id"
+    },
+    {
+      "source": "/j/:id",
+      "destination": "/web/index.html"
+    },
+    {
+      "source": "/",
+      "destination": "/web/index.html"
     }
   ]
 }

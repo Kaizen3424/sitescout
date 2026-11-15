@@ -47,6 +47,26 @@ Every batch also writes **`report.json`** - a single file with all results of th
 
 ---
 
+## Web interface (no install)
+
+Open **<https://sitescout-dusky.vercel.app>**, paste up to **50** addresses and
+press **Check websites**.
+
+- You can close the tab, the browser or your laptop: the batch runs on the server
+  and picks up where it left off when you come back.
+- The same page lists your recent batches (kept in this browser only).
+- Every batch has its own link (`/j/…`), so you can open it on your phone or send
+  it to yourself.
+- Results stay available for **30 days**, and **Download JSON** gives you the same
+  shape as the CLI's `report.json`.
+- No login. To protect the free Firecrawl and Gemini quota there is a limit of
+  8 batches per hour per address and 500 websites per day in total.
+
+The batch form needs two free Upstash services (Redis for storage, QStash for the
+background queue). Setup is in [`api/README.md`](api/README.md#deploy).
+
+---
+
 ## HTTP API (optional)
 
 There is also a TypeScript API in `api/`, made for Vercel. It runs the same
@@ -63,6 +83,15 @@ curl.exe -X POST https://your-project.vercel.app/v1/analyze `
 Unlike the CLI, the API sends the full-page screenshot untouched: no crop, no
 resize, no upload budget. See [`api/README.md`](api/README.md) for the endpoint
 contract, environment variables and deploy steps.
+
+The API has two doors:
+
+- **`POST /v1/jobs`** — the one the web page uses. Up to 50 URLs, no token, the
+  work is queued and you collect the reports later from `/v1/jobs/<id>`.
+- **`POST /v1/analyze`** — up to 5 URLs, waits for the answer, needs the bearer
+  token. Handy for scripts.
+
+`GET /v1` lists them all; `/` is the web page now, not the JSON index.
 
 ---
 
@@ -184,6 +213,7 @@ It will show `UNSCORED` or `SITE_DOWN` with the reason. Check it manually.
 | `keypool.py`      | Key health (cooldowns, retired keys).                       |
 | `urls.py`         | URL cleaning and HTTP sessions.                             |
 | `api/`            | TypeScript HTTP API for Vercel (see `api/README.md`).        |
+| `web/`            | The public page: paste URLs, come back for the reports.     |
 | `AGENTS.md`       | Short project context for AI coding agents.                  |
 | `.env`            | Your API keys (secrets, not shared).                        |
 | `.env.example`    | Template showing which settings you can put in `.env`.      |
