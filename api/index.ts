@@ -75,6 +75,8 @@ function health(): Response {
     return json({
       ok: true,
       version: API_VERSION,
+      // Which commit is actually serving this request, so a deploy can be verified.
+      commit: process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 7) ?? null,
       model: runtime.settings.decisionModel,
       keys: {
         firecrawl: runtime.firecrawl.summary(),
