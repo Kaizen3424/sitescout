@@ -514,12 +514,24 @@ export async function dispatchJob(id: string, config: JobConfig): Promise<number
 }
 
 /**
+ * The deduplication id of a retry message.
+ *
+ * QStash remembers an id for 90 days, so the attempt number must be part of it:
+ * otherwise the second retry of the same URL would be swallowed. QStash refuses
+ * ids containing a colon, hence the hyphens.
+ */
+export function requeueDedupeId(id: string, index: number, attempt: number): string {
+  return `${id}-${index}-${attempt}`;
+}
+
+/**
  * Puts one URL back in the queue after a delay.
  *
  * Called when Gemini reports a temporary quota limit. The message is a normal
  * job delivery, so the browser can stay closed; the deduplication id includes
  * the attempt number because QStash remembers ids for 90 days and would
- * otherwise ignore the second and later retries.
+ * otherwise ignore the second and later retries. QStash refuses ids containing
+ * a colon, so the parts are joined with hyphens.
  */
 export async function requeueItem(
   id: string,
@@ -537,7 +549,7 @@ export async function requeueItem(
     timeout: "280s",
     flowControl: { key: "sitescout-jobs", parallelism: config.concurrency },
     delay: Math.max(10, Math.round(delaySeconds)),
-    deduplicationId: `${id}:${index}:${attempt}`,
+    deduplicationId: requeueDedupeId(id, index, attempt),
   });
 }
 
