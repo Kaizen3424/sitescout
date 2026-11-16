@@ -30,6 +30,13 @@ export function redisCredentials(): { url: string; token: string } {
   return { url, token };
 }
 
+/** True when Redis is configured; lets optional features fall back cleanly. */
+export function hasRedis(): boolean {
+  const url = env("UPSTASH_REDIS_REST_URL") || env("KV_REST_API_URL");
+  const token = env("UPSTASH_REDIS_REST_TOKEN") || env("KV_REST_API_TOKEN");
+  return Boolean(url && token);
+}
+
 export function getRedis(): Redis {
   if (client) return client;
   const { url, token } = redisCredentials();

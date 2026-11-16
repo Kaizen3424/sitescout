@@ -27,6 +27,20 @@ export interface Settings {
   concurrency: number;
   requestDeadlineMs: number;
   maxImageBytes: number;
+  /** How many different Gemini keys one Decisions call may try. */
+  maxKeyAttempts: number;
+  /** Input tokens per minute that all Gemini keys may spend together. */
+  geminiTokensPerMinute: number;
+  /** Requests per minute that all Gemini keys may make together. */
+  geminiRequestsPerMinute: number;
+  /** Input tokens per minute for a single key (one Cloud project). */
+  geminiTokensPerKey: number;
+  /** Requests per minute for a single key. */
+  geminiRequestsPerKey: number;
+  /** First waiting time when a URL is put back in the queue. */
+  quotaRetryBaseMs: number;
+  /** After this many quota deferrals a URL is reported as unscored. */
+  quotaMaxAttempts: number;
 }
 
 function envNumber(name: string, fallback: number): number {
@@ -105,5 +119,19 @@ export function loadSettings(): Settings {
     ),
     // Google's inline limit is 20 MB; stay just below it instead of shrinking anything.
     maxImageBytes: envNumber("SITESCOUT_MAX_IMAGE_BYTES", 18 * 1024 * 1024),
+    // Three keys per call is plenty: a 429 that survives three well-spaced
+    // attempts means the project itself is out of quota, not that key four
+    // will save us.
+    maxKeyAttempts: Math.max(1, Math.min(envNumber("SITESCOUT_MAX_KEY_ATTEMPTS", 3), 14)),
+    // The free tier of the decision model allows 50,000 input tokens and 200
+    // requests per minute per Cloud project. These stay a little below that,
+    // and the shared budget is what keeps a batch inside the limit even when
+    // every key happens to belong to the same project.
+    geminiTokensPerMinute: Math.max(1_000, envNumber("SITESCOUT_GEMINI_TOKENS_PER_MINUTE", 45_000)),
+    geminiRequestsPerMinute: Math.max(1, envNumber("SITESCOUT_GEMINI_REQUESTS_PER_MINUTE", 180)),
+    geminiTokensPerKey: Math.max(1_000, envNumber("SITESCOUT_GEMINI_TOKENS_PER_KEY", 45_000)),
+    geminiRequestsPerKey: Math.max(1, envNumber("SITESCOUT_GEMINI_REQUESTS_PER_KEY", 180)),
+    quotaRetryBaseMs: Math.max(15_000, envNumber("SITESCOUT_QUOTA_RETRY_BASE_MS", 120_000)),
+    quotaMaxAttempts: Math.max(1, Math.min(envNumber("SITESCOUT_QUOTA_MAX_ATTEMPTS", 5), 12)),
   };
 }

@@ -96,7 +96,9 @@ is added). `fresh` behaves as it does for `/v1/analyze`.
     "results": [],
     "totals": {},
     "elapsed_s": 0,
-    "canRetry": true,
+    "waiting": 0,
+    "next_retry_at": null,
+    "canRetry": false,
     "ttlDays": 30
   }
 }
@@ -129,7 +131,9 @@ No auth. Current progress and every finished report:
     "results": [{ "input_url": "https://arngren.net", "verdict": "REACH_OUT" }],
     "totals": { "REACH_OUT": 4, "MAYBE": 1 },
     "elapsed_s": 184.2,
-    "canRetry": true,
+    "waiting": 2,
+    "next_retry_at": "2026-11-15T10:03:00.000Z",
+    "canRetry": false,
     "ttlDays": 30
   }
 }
@@ -139,11 +143,24 @@ No auth. Current progress and every finished report:
 finished URLs, in the order they were submitted, so a poller can grow the list
 without re-fetching earlier work. `404` once the batch is older than the TTL.
 
+`waiting` counts the URLs that hit a Gemini quota limit and are parked with a
+delayed retry; `next_retry_at` is when the soonest one tries again. Those URLs
+need no attention: they come back on their own.
+
+`canRetry` is deliberately narrow. It is only `true` when the batch made no
+progress for 15 minutes and nothing is waiting, i.e. when it really is stuck.
+
 ### `POST /v1/jobs/:id/retry`
 
 No auth. Queues the URLs that still have no report and returns the batch like
-`GET /v1/jobs/:id` with a `dispatched` count. `429` once the automatic restart
-budget is used up; start a new batch instead. A completed batch is a no-op.
+`GET /v1/jobs/:id` with a `dispatched` count. A completed batch is a no-op.
+
+`409` when there is nothing to restart:
+
+- the batch is still running normally, or
+- URLs are waiting for Gemini quota (`waiting` and `next_retry_at` say how
+  many and until when) — restarting would only spend quota twice, or
+- the automatic restart budget is used up; start a new batch instead.
 
 ### `GET /v1/jobs/:id/report.json`
 
@@ -153,8 +170,28 @@ shape of the CLI's `report.json` — with
 
 ### `GET /health`
 
-No token. Returns key counts (never key values), model name and request limits,
-or `503` when configuration is incomplete.
+No token. Returns key counts (never key values), model name, request limits and
+the current Gemini quota window, or `503` when configuration is incomplete.
+
+```json
+{
+  "ok": true,
+  "model": "gemini-decision-1",
+  "keys": { "firecrawl": { "total": 5, "alive": 5 }, "gemini": { "total": 14, "alive": 14 } },
+  "quota": {
+    "window_s": 60,
+    "tokens_per_minute": 45000,
+    "requests_per_minute": 180,
+    "global": { "tokens_used": 8120, "requests_used": 7, "cooldown_s": 0 },
+    "keys": [{ "hash": "4f1c9a0d2e6b8c31", "tokens_used": 1043, "requests_used": 1, "cooldown_s": 0 }]
+  },
+  "limits": { "max_urls": 5, "concurrency": 5, "max_key_attempts": 3, "request_deadline_s": 270 }
+}
+```
+
+Keys appear only as a 16-character hash, so the endpoint is safe to open in a
+browser. If Redis is unreachable the quota block is omitted instead of failing
+the whole answer.
 
 ## How a batch runs
 
@@ -164,25 +201,76 @@ or `503` when configuration is incomplete.
    (flow-control key `sitescout-jobs`, parallelism from
    `SITESCOUT_JOB_CONCURRENCY`). QStash retries twice and gives the function up
    to 280 s.
-3. `POST /v1/jobs/run` verifies the QStash signature, analyses **one** URL and
-   writes its report to `ss:job:<id>:r`. A URL that already has a report is
-   skipped, so a redelivery is harmless.
+3. `POST /v1/jobs/run` verifies the QStash signature, **claims** the URL,
+   analyses it and writes its report to `ss:job:<id>:r`. A URL that already has
+   a report is skipped, and the claim (`SET NX PX 420s`) stops two deliveries of
+   the same URL from both calling Gemini.
 4. When the last report lands, the hash is marked `completed`. Both keys get the
    same TTL (30 days by default), so batches clean themselves up.
 
 That one-message-per-URL design is what makes a closed tab irrelevant: nothing
 in the browser is doing the work.
 
+### When Gemini is out of quota
+
+Google's limits are counted per Cloud project, not per key, and a batch can
+easily ask for more than one project allows in a minute. A URL that runs into a
+limit is therefore **not** written off as `UNSCORED`:
+
+1. The refusal is read properly: `QuotaFailure` says which limit, `RetryInfo`
+   says how long. A per-minute limit differs from a per-day one.
+2. That one key cools down in Redis, so every worker instance leaves it alone for
+   a while. The other keys keep working.
+3. The URL goes back in the queue through QStash with a `delay` — 2 minutes
+   first, doubling per attempt up to 15. A daily limit waits for midnight
+   Pacific, where Google resets it.
+4. The page shows "Waiting for quota" with a countdown. No button to press, and
+   closing the tab changes nothing.
+5. After `SITESCOUT_QUOTA_MAX_ATTEMPTS` (5, or 2 for a daily limit) the URL
+   becomes `UNSCORED` with the actual reason instead of a generic failure.
+
+A requeued URL is captured with Firecrawl again: the screenshot is not kept in
+Redis (it is far too large), so the capture credit is spent twice. The Gemini
+answers are cached in Redis by page content, so an unchanged page does not pay
+for the same questions twice.
+
+### Why the keys do not simply rotate
+
+Rotating through every key on each `429` is what turned a single minute of
+exhausted quota into an hour of failures: 14 keys, one sweep each, a ~58 s wait,
+then another sweep. Now:
+
+- a call tries at most `SITESCOUT_MAX_KEY_ATTEMPTS` keys (3) and then defers;
+- a key that is cooling down in Redis is skipped without spending an attempt;
+- the shared budget in Redis stops the burst before Google has to.
+
+The shared budget is the important one: it stays inside the free tier even if
+every configured key happens to belong to the same Cloud project. The per-key
+budget is the second line of defence.
+
 ## Redis layout
 
 | Key | Type | Contents |
 |-----|------|----------|
-| `ss:job:<id>` | hash | `createdAt`, `urls`, `total`, `fresh`, `status`, `dispatches`, `completedAt`, `error` |
+| `ss:job:<id>` | hash | `createdAt`, `urls`, `total`, `fresh`, `status`, `dispatches`, `lastProgressAt`, `completedAt`, `error` |
 | `ss:job:<id>:r` | hash | field `"<index>"` → JSON report |
+| `ss:job:<id>:a` | hash | field `"<index>"` → quota deferrals so far |
+| `ss:job:<id>:w` | hash | field `"<index>"` → due timestamp of the delayed retry |
+| `ss:job:<id>:claim:<index>` | string | `SET NX PX 420s`, one owner per URL |
+| `ss:quota:tok:<scope>` | sorted set | reserved tokens in the rolling minute |
+| `ss:quota:req:<scope>` | sorted set | requests in the rolling minute |
+| `ss:quota:cd:<scope>` | string | cooldown end timestamp |
+| `ss:cache:<hash>` | string | cached Decisions answers (72 h) |
 | `ss:rate:job:<ip-hash>:<hour>` | counter | batches per address per hour |
 | `ss:rate:urls:<date>` | counter | URLs analysed today (UTC) |
 
-Addresses are stored as a 16-character SHA-256 prefix, never raw.
+`<scope>` is either `global` (all keys together) or a key hash. Addresses and
+keys are stored as a 16-character SHA-256 prefix, never raw:
+
+- a key hash keeps the quota book free of key material, so `/health` can show
+  the budgets without leaking anything;
+- an address hash keeps the rate limiter free of personal data.
+
 
 ## Environment variables
 
@@ -211,7 +299,19 @@ Addresses are stored as a 16-character SHA-256 prefix, never raw.
 | `SITESCOUT_JOB_CONCURRENCY` | no | `5` | How many URLs one deployment analyses at once (max 10). |
 | `SITESCOUT_JOBS_PER_HOUR` | no | `8` | Batches per address per hour. |
 | `SITESCOUT_DAILY_URL_BUDGET` | no | `500` | URLs per day across everyone (UTC). |
+| `SITESCOUT_GEMINI_TOKENS_PER_MINUTE` | no | `45000` | Input tokens per minute for **all** Gemini keys together. |
+| `SITESCOUT_GEMINI_REQUESTS_PER_MINUTE` | no | `180` | Requests per minute for all keys together. |
+| `SITESCOUT_GEMINI_TOKENS_PER_KEY` | no | `45000` | Input tokens per minute for one key. |
+| `SITESCOUT_GEMINI_REQUESTS_PER_KEY` | no | `180` | Requests per minute for one key. |
+| `SITESCOUT_MAX_KEY_ATTEMPTS` | no | `3` | How many different Gemini keys one call may try (max 14). |
+| `SITESCOUT_QUOTA_RETRY_BASE_MS` | no | `120000` | First delay before a quota-blocked URL is retried; doubles per attempt. |
+| `SITESCOUT_QUOTA_MAX_ATTEMPTS` | no | `5` | Quota deferrals before a URL is reported as unscored (daily limits: 2). |
 | `SITESCOUT_JOBS_INLINE` | no | off | Development only: run the batch inside the request, no QStash. |
+
+Leave the four `SITESCOUT_GEMINI_*` budgets alone unless your Google plan is
+bigger than the free tier: the free tier of the decision model allows 50,000
+input tokens and 200 requests per minute per Cloud project, and the defaults sit
+just below that.
 
 The image itself is **never** cropped, resized or recompressed. The size in the
 report is the full-page capture from Firecrawl.
@@ -279,9 +379,11 @@ limit does not matter.
 - The default daily ceiling in code is 500 URLs, comfortably inside both free
   tiers. `SITESCOUT_JOBS_PER_HOUR=8` stops one visitor from spending the day's
   budget with a script.
-- Runtime Cache items are capped at 2 MB, so screenshots are not cached. Gemini
-  answers are cached for 72 h, keyed by the page's HTML content, so re-running an
-  unchanged page spends Firecrawl credits but no Gemini quota.
-- Each URL costs 1 Firecrawl credit and 3 Gemini calls.
+- Screenshots are never cached: they are far too large for Redis (250 MB total)
+  and for the Runtime Cache (2 MB per item). Gemini answers **are** cached in
+  Redis for 72 h, keyed by the page's HTML content, so re-running an unchanged
+  page spends Firecrawl credits but no Gemini quota.
+- Each URL costs 1 Firecrawl credit and 3 Gemini calls (design, verdict, page —
+  deliberately separate calls, never merged).
 - Hobby is for non-commercial use. Ads, paid access, or client lead-generation
   would require Vercel Pro; Cloudflare Workers Paid is the cheaper paid fallback.

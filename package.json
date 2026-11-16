@@ -9,6 +9,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "test": "tsx --test \"test/**/*.test.ts\"",
     "dev": "vercel dev",
     "deploy": "vercel --prod"
   },
@@ -19,6 +20,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.18.0",
+    "tsx": "^4.23.15",
     "typescript": "^5.9.3"
   }
 }

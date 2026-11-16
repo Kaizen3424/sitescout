@@ -526,6 +526,15 @@ textarea:disabled {
   animation: pulse 1.6s ease-in-out infinite;
 }
 
+.chip[data-tone="waiting"] {
+  background: var(--warn-wash);
+  color: var(--warn);
+}
+
+.chip[data-tone="waiting"]::before {
+  animation: pulse 2.8s ease-in-out infinite;
+}
+
 .chip[data-tone="completed"] {
   background: var(--good-wash);
   color: var(--good);

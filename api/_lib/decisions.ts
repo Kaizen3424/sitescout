@@ -14,9 +14,18 @@ import { createHash } from "node:crypto";
 import { cacheGet, cacheSet } from "./cache.js";
 import type { Settings } from "./env.js";
 import { USER_AGENT } from "./env.js";
-import { CaptureError, DecisionError, FatalApiError, NetworkError, ShapeError } from "./errors.js";
-import { errorMessage, fetchWithKeys, safeJson, stableStringify } from "./http.js";
+import {
+  CaptureError,
+  DecisionError,
+  FatalApiError,
+  KeyUnavailableError,
+  NetworkError,
+  QuotaDeferredError,
+  ShapeError,
+} from "./errors.js";
+import { errorMessage, fetchWithKeys, retryAfterMs, safeJson, stableStringify } from "./http.js";
 import type { KeyPool } from "./keys.js";
+import { GLOBAL_SCOPE, estimateInputTokens, keyHash, type QuotaGrant, type QuotaGuard } from "./quota.js";
 import type { ParsedAnswers } from "./types.js";
 
 const DECISIONS_URL = "https://generativelanguage.googleapis.com/v1beta/decisions";
@@ -310,6 +319,110 @@ interface GroupResult {
   usage: unknown;
 }
 
+/* ------------------------------------------------------------ quota signals */
+
+export interface QuotaSignal {
+  /** Which limit Google says we hit. */
+  scope: "minute" | "day";
+  /** How long Google suggests waiting. */
+  retryAfterMs: number;
+  metric: string | null;
+  quotaId: string | null;
+  /** The limit Google reports, when it says so (tokens or requests). */
+  quotaValue: number | null;
+}
+
+const DAY_LIMIT = /(per\s*day|perday|daily)/i;
+
+/** Reads durations like "27s", "1.5s" or "1m30s". */
+function parseDelay(value: unknown): number | null {
+  if (typeof value !== "string" || !value.trim()) return null;
+  let total = 0;
+  let matched = false;
+  const pattern = /(\d+(?:\.\d+)?)(h|m|s|ms)/g;
+  for (const match of value.matchAll(pattern)) {
+    const amount = Number(match[1]);
+    if (!Number.isFinite(amount)) continue;
+    matched = true;
+    const unit = match[2];
+    if (unit === "h") total += amount * 3_600_000;
+    else if (unit === "m") total += amount * 60_000;
+    else if (unit === "ms") total += amount;
+    else total += amount * 1_000;
+  }
+  return matched ? total : null;
+}
+
+/**
+ * Turns a 429 body into a decision: which limit, and how long to wait.
+ *
+ * Google answers with `google.rpc.QuotaFailure` (metric and quota id) plus
+ * `google.rpc.RetryInfo` (how long). The id is what tells a per-minute limit
+ * from a per-day one, and that difference decides whether retrying in two
+ * minutes helps or is pointless until midnight Pacific.
+ */
+export function readQuotaSignal(payload: unknown, res?: Response): QuotaSignal {
+  const headerMs = res ? retryAfterMs(res, 23 * 3_600_000) : null;
+  let metric: string | null = null;
+  let quotaId: string | null = null;
+  let quotaValue: number | null = null;
+  let retryMs: number | null = null;
+
+  const error =
+    payload && typeof payload === "object"
+      ? (payload as Record<string, unknown>).error
+      : null;
+  const details =
+    error && typeof error === "object"
+      ? (error as Record<string, unknown>).details
+      : null;
+
+  if (Array.isArray(details)) {
+    for (const detail of details) {
+      if (!detail || typeof detail !== "object") continue;
+      const record = detail as Record<string, unknown>;
+      const type = String(record["@type"] ?? "");
+      if (type.includes("QuotaFailure") && Array.isArray(record.violations)) {
+        const first = record.violations.find(
+          (item): item is Record<string, unknown> => Boolean(item) && typeof item === "object",
+        );
+        if (first) {
+          if (typeof first.quotaMetric === "string") metric = first.quotaMetric;
+          if (typeof first.quotaId === "string") quotaId = first.quotaId;
+          const value = Number(first.quotaValue);
+          if (Number.isFinite(value) && value > 0) quotaValue = value;
+        }
+      }
+      if (type.includes("RetryInfo")) {
+        const delay = parseDelay(record.retryDelay);
+        if (delay !== null) retryMs = delay;
+      }
+    }
+  }
+
+  const label = `${quotaId ?? ""} ${metric ?? ""}`;
+  const scope: "minute" | "day" = DAY_LIMIT.test(label) ? "day" : "minute";
+  const ceiling = scope === "day" ? 23 * 3_600_000 : 15 * 60_000;
+  const suggested = retryMs ?? headerMs ?? (scope === "day" ? 3_600_000 : 60_000);
+
+  return {
+    scope,
+    retryAfterMs: Math.max(5_000, Math.min(Math.round(suggested), ceiling)),
+    metric,
+    quotaId,
+    quotaValue,
+  };
+}
+
+/** Reads an error body without consuming the response the caller still needs. */
+async function peekJson(res: Response): Promise<unknown> {
+  try {
+    return await safeJson(res.clone());
+  } catch {
+    return null;
+  }
+}
+
 function fingerprint(settings: Settings): string {
   const blob = stableStringify({
     v: DECISION_CACHE_VERSION,
@@ -323,6 +436,7 @@ function fingerprint(settings: Settings): string {
 async function askGroup(
   settings: Settings,
   pool: KeyPool,
+  quota: QuotaGuard,
   imageB64: string,
   mime: string,
   group: QuestionGroup,
@@ -337,9 +451,21 @@ async function askGroup(
     questions: group.questions,
   };
   const requestBody = JSON.stringify(body);
+  // Text is counted from the request without the base64 image; the image has
+  // its own measured price per resolution.
+  const textChars =
+    CONTEXT_TEXT.length + JSON.stringify(group.questions).length + settings.decisionModel.length + 32;
   let lastShape: ShapeError | null = null;
 
   for (let attempt = 1; attempt <= 2; attempt += 1) {
+    // An object, so the hooks below can change what the loop sees without
+    // fighting TypeScript's narrowing.
+    const state: {
+      held: { key: string; grant: QuotaGrant; estimate: number } | null;
+      refusal: { waitMs: number; scopeKey: string } | null;
+      quota: QuotaSignal | null;
+    } = { held: null, refusal: null, quota: null };
+
     let res: Response;
     try {
       res = await fetchWithKeys(DECISIONS_URL, {
@@ -359,13 +485,86 @@ async function askGroup(
         timeoutMs: 90_000,
         deadline: opts.deadline,
         signal: opts.signal,
+        // A handful of keys, never the whole pool: sweeping every key is what
+        // turned one minute of quota into an hour of failures.
+        maxKeyAttempts: settings.maxKeyAttempts,
+        whenExhausted: "fail",
+        prepare: async (key) => {
+          const estimate = estimateInputTokens({
+            textChars,
+            resolution: settings.imageResolution,
+            observed: quota.learnedTokens(key),
+          });
+          const acquired = await quota.acquire(key, estimate);
+          if (!acquired.ok) {
+            state.refusal = { waitMs: acquired.waitMs, scopeKey: acquired.scopeKey };
+            console.warn(
+              `Gemini ${group.name}: the ${
+                acquired.scopeKey === GLOBAL_SCOPE ? "shared" : "per-key"
+              } token budget is spent, next slot in ${Math.round(acquired.waitMs / 1000)}s`,
+            );
+            return false;
+          }
+          state.held = { key, grant: acquired.grant, estimate };
+          return true;
+        },
+        discard: async (key, reason, response) => {
+          const current = state.held;
+          state.held = null;
+          if (reason === "rate_limited") {
+            const signal = readQuotaSignal(response ? await peekJson(response) : null, response);
+            state.quota = signal;
+            await quota.noteRateLimited(key, {
+              retryAfterMs: signal.retryAfterMs,
+              scope: signal.scope,
+            });
+            // The call was made, so it counts as a request, but it did not
+            // burn tokens: give those back.
+            if (current) await quota.settle(current.grant, null, 0);
+            console.warn(
+              `quota event: key ${keyHash(key)} hit its ${signal.scope} limit ` +
+                `(${signal.quotaId ?? signal.metric ?? "unknown"}` +
+                `${signal.quotaValue ? `=${signal.quotaValue}` : ""}), ` +
+                `retry in ${Math.round(signal.retryAfterMs / 1000)}s`,
+            );
+            return;
+          }
+          if (current) await quota.abandon(current.grant);
+        },
       });
     } catch (err) {
+      const refusal = state.refusal;
+      if (refusal) {
+        throw new QuotaDeferredError(
+          `Gemini ${group.name}: the ${
+            refusal.scopeKey === GLOBAL_SCOPE ? "shared" : "per-key"
+          } token budget is spent; retrying in about ${Math.round(refusal.waitMs / 1000)}s`,
+          { retryAfterMs: refusal.waitMs, scope: "minute" },
+        );
+      }
+      if (err instanceof KeyUnavailableError) {
+        throw new QuotaDeferredError(`Gemini ${group.name}: ${err.message}`, {
+          retryAfterMs: err.retryAfterMs,
+          scope: "minute",
+        });
+      }
       if (err instanceof NetworkError) throw new DecisionError(err.message);
       throw err;
     }
 
     const payload = await safeJson(res);
+    const held = state.held;
+    if (held) {
+      state.held = null;
+      await quota.settle(
+        held.grant,
+        payload && typeof payload === "object"
+          ? (payload as Record<string, unknown>).usage
+          : null,
+        held.estimate,
+      );
+    }
+
     const message = errorMessage(payload, res);
     const errorCode =
       payload && typeof payload === "object" && typeof (payload as Record<string, unknown>).error === "object"
@@ -389,7 +588,12 @@ async function askGroup(
       throw new DecisionError(`Gemini rejected the '${group.name}' questions (400): ${message}`, kind);
     }
     if (res.status === 429) {
-      throw new DecisionError(`All Gemini API keys are rate-limited (429): ${message}`, "quota");
+      const signal = state.quota ?? readQuotaSignal(payload, res);
+      throw new QuotaDeferredError(
+        `Gemini is out of ${signal.scope === "day" ? "daily" : "per-minute"} quota ` +
+          `(${signal.quotaId ?? signal.metric ?? "unknown limit"}): ${message}`,
+        { retryAfterMs: signal.retryAfterMs, scope: signal.scope },
+      );
     }
     if (res.status >= 400) {
       throw new DecisionError(`Gemini HTTP ${res.status} (${group.name}): ${message}`);
@@ -425,6 +629,8 @@ export interface DecisionsResult extends ParsedAnswers {
 export interface DecisionsOptions {
   settings: Settings;
   pool: KeyPool;
+  /** Shared token budgets; without it no reservation is made (CLI-style use). */
+  quota: QuotaGuard;
   image: Buffer;
   mime: string | null;
   /** Identifies the page content (final URL + HTML hash). */
@@ -435,7 +641,7 @@ export interface DecisionsOptions {
 }
 
 export async function runDecisions(options: DecisionsOptions): Promise<DecisionsResult> {
-  const { settings, pool, image, mime, pageKey, fresh } = options;
+  const { settings, pool, quota, image, mime, pageKey, fresh } = options;
 
   if (image.length > Math.min(settings.maxImageBytes, MAX_INLINE_IMAGE_BYTES)) {
     throw new CaptureError(
@@ -484,7 +690,7 @@ export async function runDecisions(options: DecisionsOptions): Promise<Decisions
       result = entry;
     } else {
       merged.fromCache = false;
-      result = await askGroup(settings, pool, imageB64, mime, group, {
+      result = await askGroup(settings, pool, quota, imageB64, mime, group, {
         signal: options.signal,
         deadline: options.deadline,
       });

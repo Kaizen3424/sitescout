@@ -87,9 +87,32 @@ function budgetReport(url: string): Report {
   return report;
 }
 
-function health(): Response {
+async function health(): Promise<Response> {
   try {
     const runtime = getRuntime();
+    let quota: Record<string, unknown> | null = null;
+    try {
+      const snapshot = await runtime.quota.report(runtime.settings.geminiKeys);
+      quota = {
+        window_s: 60,
+        tokens_per_minute: runtime.settings.geminiTokensPerMinute,
+        requests_per_minute: runtime.settings.geminiRequestsPerMinute,
+        global: {
+          tokens_used: snapshot.global.tokensUsed,
+          requests_used: snapshot.global.requestsUsed,
+          cooldown_s: Math.max(0, Math.round((snapshot.global.cooldownUntil - Date.now()) / 1000)),
+        },
+        // Only hashes: never the key itself.
+        keys: snapshot.keys.map((entry) => ({
+          hash: entry.hash,
+          tokens_used: entry.tokensUsed,
+          requests_used: entry.requestsUsed,
+          cooldown_s: Math.round(entry.cooldownMs / 1000),
+        })),
+      };
+    } catch (err) {
+      console.warn(`health: quota snapshot failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
     return json({
       ok: true,
       version: API_VERSION,
@@ -100,9 +123,11 @@ function health(): Response {
         firecrawl: runtime.firecrawl.summary(),
         gemini: runtime.gemini.summary(),
       },
+      quota,
       limits: {
         max_urls: runtime.settings.maxUrls,
         concurrency: runtime.settings.concurrency,
+        max_key_attempts: runtime.settings.maxKeyAttempts,
         request_deadline_s: Math.round(runtime.settings.requestDeadlineMs / 1000),
       },
     });
@@ -143,7 +168,12 @@ function parseAnalyzeBody(body: unknown): AnalyzeRequest | { error: string } {
 }
 
 function analyzeDeps(runtime: Runtime): AnalyzeDeps {
-  return { settings: runtime.settings, firecrawl: runtime.firecrawl, gemini: runtime.gemini };
+  return {
+    settings: runtime.settings,
+    firecrawl: runtime.firecrawl,
+    gemini: runtime.gemini,
+    quota: runtime.quota,
+  };
 }
 
 /* ------------------------------------------------------- /v1/analyze (sync) */
@@ -449,9 +479,19 @@ async function handleRetryJob(jobId: string): Promise<Response> {
       return json({ ok: true, dispatched: 0, job: jobPayload(view) });
     }
     if (!view.canRetry) {
+      if (view.waiting > 0) {
+        return failure(
+          `This batch is waiting for Gemini quota; ${view.waiting} website(s) retry automatically. ` +
+            "There is nothing to restart.",
+          409,
+          { waiting: view.waiting, next_retry_at: view.next_retry_at },
+        );
+      }
       return failure(
-        "This batch cannot be restarted any more. Start a new batch instead.",
-        429,
+        view.done < view.total
+          ? "This batch is still running. Wait until it stops making progress, then try again."
+          : "This batch cannot be restarted any more. Start a new batch instead.",
+        409,
       );
     }
     const queued = await dispatchJob(jobId, config);

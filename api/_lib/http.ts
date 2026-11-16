@@ -2,7 +2,7 @@
  * HTTP helpers: retries with backoff, plus retry-with-key-rotation on top.
  * Mirrors the Python `httpio.py`, using the global fetch available on Vercel.
  */
-import { DeadlineError, FatalApiError, NetworkError } from "./errors.js";
+import { DeadlineError, FatalApiError, KeyUnavailableError, NetworkError } from "./errors.js";
 import type { KeyPool } from "./keys.js";
 
 const RETRY_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
@@ -21,7 +21,29 @@ export interface RetryOptions {
 export interface KeyedOptions extends RetryOptions {
   pool: KeyPool;
   buildInit: (key: string) => RequestInit;
+  /**
+   * How many different keys this one request may try.
+   *
+   * Defaults to the whole pool, which is what the capture API wants. Gemini
+   * passes a small number on purpose: sweeping fourteen keys on every 429 is
+   * what turned a single minute of quota into an hour of failures.
+   */
+  maxKeyAttempts?: number;
+  /**
+   * What to do when every key is cooling down and no request can be sent:
+   * `"wait"` (default) sleeps for the soonest key, `"fail"` throws
+   * `KeyUnavailableError` so the caller can requeue the work instead of
+   * burning the request's time budget.
+   */
+  whenExhausted?: "wait" | "fail";
+  /** Upper bound for a single wait, in milliseconds. */
   maxKeyWaitMs?: number;
+  /** Called once before the first request with a key; false means "skip this key". */
+  prepare?: (key: string) => Promise<boolean>;
+  /** Called when the key produced a final answer. */
+  settle?: (key: string, res: Response) => Promise<void>;
+  /** Called when the attempt is abandoned after the request was sent. */
+  discard?: (key: string, reason: "rate_limited" | "failed", res?: Response) => Promise<void>;
 }
 
 /**
@@ -59,12 +81,13 @@ function timeLeft(deadline?: number): number {
   return deadline === undefined ? Infinity : Math.max(0, deadline - Date.now());
 }
 
-function retryAfterMs(res: Response): number | null {
+/** `Retry-After` in milliseconds, or null when Google did not send one. */
+export function retryAfterMs(res: Response, capMs = 60_000): number | null {
   const raw = res.headers.get("retry-after");
   if (!raw) return null;
   const seconds = Number(raw);
   if (!Number.isFinite(seconds)) return null;
-  return Math.max(0, Math.min(seconds, 60)) * 1000;
+  return Math.max(0, Math.min(seconds * 1000, capMs));
 }
 
 function backoffMs(attempt: number, baseSeconds: number): number {
@@ -147,14 +170,20 @@ export async function fetchWithRetry(
  * Like fetchWithRetry, but rotates API keys on auth and rate-limit failures.
  *
  *   401/402/403 -> key retired, switch immediately
- *   429         -> key cools down for 60s, switch immediately; if every key is
- *                  cooling down, wait for the soonest one (bounded)
+ *   429         -> key cools down, switch immediately, but never more than
+ *                  `maxKeyAttempts` keys; the 429 is returned to the caller
+ *                  once the budget is spent (it decides whether to retry later)
  *   5xx/network -> retry the same key with backoff, then switch keys
+ *
+ * The function never sleeps waiting for a rate-limited key unless
+ * `whenExhausted` is "wait", and it never touches a key twice.
  */
 export async function fetchWithKeys(url: string, opts: KeyedOptions): Promise<Response> {
   const attempts = opts.retries + 1;
   const maxKeyWait = opts.maxKeyWaitMs ?? 180_000;
+  const maxKeys = Math.max(1, Math.min(opts.maxKeyAttempts ?? opts.pool.size, opts.pool.size));
   const tried = new Set<string>();
+  let keysTried = 0;
   let lastResponse: Response | null = null;
   let lastError: Error | null = null;
   let waited = 0;
@@ -175,6 +204,9 @@ export async function fetchWithKeys(url: string, opts: KeyedOptions): Promise<Re
       }
       const wait = opts.pool.msUntilReady();
       if (wait === null) throw new FatalApiError(`All ${opts.pool.name} API keys are unusable.`);
+      if (opts.whenExhausted === "fail") {
+        throw new KeyUnavailableError(`${opts.label}: every key is cooling down`, wait);
+      }
       // Never plan to wait beyond what is left of the request budget.
       const waitCap = Math.min(maxKeyWait, timeLeft(opts.deadline));
       if (waited + wait > waitCap) {
@@ -194,15 +226,28 @@ export async function fetchWithKeys(url: string, opts: KeyedOptions): Promise<Re
     tried.add(key);
     const tag = `${opts.label}[...${key.slice(-4)}]`;
 
+    // The shared cooldown may say "not this one", even though this instance
+    // still thinks the key is fine. Skipping it does not use up a key attempt.
+    const ready = opts.prepare ? await opts.prepare(key) : true;
+    if (!ready) {
+      console.warn(`${tag}: still cooling down elsewhere - trying another key`);
+      continue;
+    }
+    keysTried += 1;
+
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       let res: Response;
       try {
         res = await fetchOnce(url, opts.buildInit(key), attemptTimeout(opts), opts);
       } catch (err) {
-        if (err instanceof DeadlineError) throw err;
+        if (err instanceof DeadlineError) {
+          await opts.discard?.(key, "failed");
+          throw err;
+        }
         lastError = err instanceof Error ? err : new Error(String(err));
         if (attempt >= attempts) {
           opts.pool.reportFailure(key, { cooldownMs: 30_000 });
+          await opts.discard?.(key, "failed");
           break;
         }
         const wait = backoffMs(attempt, opts.backoff);
@@ -218,22 +263,29 @@ export async function fetchWithKeys(url: string, opts: KeyedOptions): Promise<Re
       if (res.status === 401 || res.status === 402 || res.status === 403) {
         opts.pool.reportFailure(key, { fatal: true });
         console.warn(`${tag}: key rejected (${res.status}) - retiring and switching keys`);
+        await opts.discard?.(key, "failed");
         break;
       }
 
       if (res.status === 429) {
-        opts.pool.reportRateLimited(key);
-        console.warn(`${tag}: rate-limited (429) - switching keys`);
+        opts.pool.reportRateLimited(key, retryAfterMs(res, 15 * 60_000) ?? 60_000);
+        console.warn(
+          `${tag}: rate-limited (429) - cooling this key down and trying another ` +
+            `(${keysTried}/${maxKeys})`,
+        );
+        await opts.discard?.(key, "rate_limited", res);
         break;
       }
 
       if (!RETRY_STATUSES.has(res.status)) {
         opts.pool.reportSuccess(key);
+        await opts.settle?.(key, res);
         return res;
       }
 
       if (attempt >= attempts) {
         opts.pool.reportFailure(key, { cooldownMs: 30_000 });
+        await opts.discard?.(key, "failed");
         break;
       }
 
@@ -241,6 +293,13 @@ export async function fetchWithKeys(url: string, opts: KeyedOptions): Promise<Re
       console.warn(`${tag}: HTTP ${res.status} (attempt ${attempt}/${attempts}) - retrying in ${Math.round(wait)}ms`);
       await discardBody(res);
       await sleep(wait, opts.signal, opts.deadline);
+    }
+
+    if (keysTried >= maxKeys) {
+      // Hand the last answer back: a 429 here is the caller's signal that the
+      // quota ran out, and it knows how to defer the work.
+      if (lastResponse) return lastResponse;
+      throw lastError ?? new NetworkError(`${opts.label}: request failed`);
     }
   }
 }

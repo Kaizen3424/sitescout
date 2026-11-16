@@ -10,6 +10,7 @@ import { captureSite } from "./firecrawl.js";
 import { analyzeHtml, guessBusinessName } from "./htmlchecks.js";
 import { describeImage } from "./imagesize.js";
 import type { KeyPool } from "./keys.js";
+import type { QuotaGuard } from "./quota.js";
 import { baseReport } from "./report.js";
 import { evaluate, outreachOpening } from "./scoring.js";
 import type { Capture, Report } from "./types.js";
@@ -26,6 +27,7 @@ export interface AnalyzeDeps {
   settings: Settings;
   firecrawl: KeyPool;
   gemini: KeyPool;
+  quota: QuotaGuard;
 }
 
 export async function analyzeUrl(
@@ -79,6 +81,7 @@ export async function analyzeUrl(
     modelOut = await runDecisions({
       settings,
       pool: deps.gemini,
+      quota: deps.quota,
       image: capture.image,
       mime: imageInfo.mime,
       pageKey,

@@ -22,6 +22,7 @@ const VERDICTS = [
 const STATUS_LABELS = {
   queued: "Queued",
   running: "Running",
+  waiting: "Waiting for quota",
   completed: "Completed",
   failed: "Failed",
 };
@@ -398,10 +399,11 @@ function renderJob(job) {
   state.job = job;
   hideJobError();
 
-  const status = STATUS_LABELS[job.status] ?? job.status;
+  const waiting = Number(job.waiting) || 0;
+  const statusKey = job.status === "running" && waiting > 0 ? "waiting" : job.status;
   const chip = $("job-status");
-  chip.textContent = status;
-  chip.dataset.tone = job.status;
+  chip.textContent = STATUS_LABELS[statusKey] ?? job.status;
+  chip.dataset.tone = statusKey;
 
   const first = job.urls?.[0] ?? "";
   $("job-title").textContent =
@@ -429,6 +431,7 @@ function renderJob(job) {
 function renderProgress(job) {
   const total = Number(job.total) || 0;
   const done = Number(job.done) || 0;
+  const waiting = Number(job.waiting) || 0;
   const percent = total > 0 ? Math.round((done / total) * 100) : 0;
   $("progress-fill").style.width = `${percent}%`;
   $("progress").setAttribute("aria-valuenow", String(percent));
@@ -440,6 +443,14 @@ function renderProgress(job) {
     }.`;
   } else if (job.status === "failed") {
     text.textContent = `${done} of ${total} analysed before the batch stopped.`;
+  } else if (waiting > 0) {
+    // Gemini is temporarily out of quota. The server retries on its own, so
+    // the page must say so instead of looking stuck.
+    const when = countdown(job.next_retry_at);
+    const which = `${waiting} ${waiting === 1 ? "website is" : "websites are"} waiting for Gemini quota`;
+    text.textContent = `${done} of ${total} analysed · ${which}${
+      when ? `, retrying in about ${when}` : ", retrying shortly"
+    }. Nothing is lost if you close this tab.`;
   } else if (done === 0) {
     text.textContent = `0 of ${total} analysed · the first report usually arrives within a minute.`;
   } else {
@@ -448,6 +459,20 @@ function renderProgress(job) {
     const eta = average > 0 ? ` · about ${formatDuration(average * remaining)} left` : "";
     text.textContent = `${done} of ${total} analysed${eta}. You can close this tab.`;
   }
+}
+
+/** "3 min" / "40 s" until an ISO timestamp, or "" when it is unknown. */
+function countdown(iso) {
+  if (!iso) return "";
+  const target = Date.parse(iso);
+  if (!Number.isFinite(target)) return "";
+  const seconds = Math.max(0, Math.round((target - Date.now()) / 1000));
+  if (seconds <= 30) return "half a minute";
+  if (seconds < 90) return "a minute";
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.round(minutes / 60);
+  return hours === 1 ? "an hour" : `${hours} hours`;
 }
 
 function renderTotals(job) {
@@ -470,6 +495,7 @@ function renderJobFoot(job) {
   const foot = $("job-foot");
   const note = $("job-foot-note");
   const retry = $("retry");
+  const waiting = Number(job.waiting) || 0;
   const unfinished = job.status !== "completed" && (job.done ?? 0) < (job.total ?? 0);
 
   retry.hidden = !unfinished || !job.canRetry;
@@ -479,10 +505,18 @@ function renderJobFoot(job) {
   if (state.notice) {
     note.textContent = state.notice;
     foot.hidden = false;
+  } else if (waiting > 0) {
+    const when = countdown(job.next_retry_at);
+    note.textContent =
+      `Gemini's free quota is used up for the moment. ${waiting} ` +
+      `${waiting === 1 ? "website is" : "websites are"} queued to try again${
+        when ? ` in about ${when}` : " shortly"
+      } — automatically, so you can close this tab.`;
+    foot.hidden = false;
   } else if (unfinished) {
     note.textContent = job.canRetry
-      ? "The batch is queued in the background. Nothing is lost if you close the tab."
-      : "This batch cannot be restarted automatically. Start a new batch instead.";
+      ? "The batch stopped making progress. Press Retry to queue the missing websites again."
+      : "The batch is queued in the background. Nothing is lost if you close the tab.";
     foot.hidden = false;
   } else if (job.status === "completed") {
     note.textContent = `Reports stay available for ${job.ttlDays ?? 30} days on this page and in the JSON download.`;
