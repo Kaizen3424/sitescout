@@ -226,11 +226,12 @@ export async function fetchWithKeys(url: string, opts: KeyedOptions): Promise<Re
     tried.add(key);
     const tag = `${opts.label}[...${key.slice(-4)}]`;
 
-    // The shared cooldown may say "not this one", even though this instance
-    // still thinks the key is fine. Skipping it does not use up a key attempt.
+    // The shared cooldown or budget may say "not this one", even though this
+    // instance still thinks the key is fine. Skipping it does not use up a key
+    // attempt, so a pool with one busy key does not lose a chance.
     const ready = opts.prepare ? await opts.prepare(key) : true;
     if (!ready) {
-      console.warn(`${tag}: still cooling down elsewhere - trying another key`);
+      console.warn(`${tag}: no room on this key right now - trying another key`);
       continue;
     }
     keysTried += 1;

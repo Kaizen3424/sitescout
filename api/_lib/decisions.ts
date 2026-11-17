@@ -497,12 +497,22 @@ async function askGroup(
           });
           const acquired = await quota.acquire(key, estimate);
           if (!acquired.ok) {
-            state.refusal = { waitMs: acquired.waitMs, scopeKey: acquired.scopeKey };
+            const shared = acquired.scopeKey === GLOBAL_SCOPE;
             console.warn(
-              `Gemini ${group.name}: the ${
-                acquired.scopeKey === GLOBAL_SCOPE ? "shared" : "per-key"
-              } token budget is spent, next slot in ${Math.round(acquired.waitMs / 1000)}s`,
+              `Gemini ${group.name}: the ${shared ? "shared" : "per-key"} token budget is spent, ` +
+                `next slot in ${Math.round(acquired.waitMs / 1000)}s`,
             );
+            if (shared) {
+              // Every key draws from the same budget, so walking the rest of
+              // the pool would only cost Redis calls before the same answer.
+              throw new QuotaDeferredError(
+                `Gemini ${group.name}: the shared token budget is spent; ` +
+                  `retrying in about ${Math.round(acquired.waitMs / 1000)}s`,
+                { retryAfterMs: acquired.waitMs, scope: "minute" },
+              );
+            }
+            // Only this key is out: another one may still have room.
+            state.refusal = { waitMs: acquired.waitMs, scopeKey: acquired.scopeKey };
             return false;
           }
           state.held = { key, grant: acquired.grant, estimate };

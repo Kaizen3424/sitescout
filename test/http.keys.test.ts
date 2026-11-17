@@ -10,7 +10,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import test from "node:test";
 
-import { KeyUnavailableError } from "../api/_lib/errors.js";
+import { KeyUnavailableError, QuotaDeferredError } from "../api/_lib/errors.js";
 import { fetchWithKeys } from "../api/_lib/http.js";
 import type { KeyPool } from "../api/_lib/keys.js";
 
@@ -212,6 +212,40 @@ test("no request is sent when every key is cooling down", async () => {
       },
     );
     assert.equal(harness.requests.length, 0);
+  } finally {
+    await stop(harness);
+  }
+});
+
+test("a refusal raised before sending stops the walk at once", async () => {
+  const harness = await startServer([200]);
+  const pool = new FakePool(KEYS);
+  const prepared: string[] = [];
+  try {
+    await assert.rejects(
+      fetchWithKeys(harness.url, {
+        pool: pool as unknown as KeyPool,
+        buildInit: (key) => ({ headers: { "x-key": key } }),
+        label: "Gemini test",
+        retries: 0,
+        backoff: 0.1,
+        timeoutMs: 5_000,
+        maxKeyAttempts: 3,
+        whenExhausted: "fail",
+        prepare: async (key) => {
+          prepared.push(key);
+          // A shared budget refusal applies to every key: walking the rest of
+          // the pool would only cost Redis calls before the same answer.
+          throw new QuotaDeferredError("the shared budget is spent", {
+            retryAfterMs: 30_000,
+            scope: "minute",
+          });
+        },
+      }),
+      (err: unknown) => err instanceof QuotaDeferredError,
+    );
+    assert.equal(prepared.length, 1, "one key is enough to learn the answer");
+    assert.equal(harness.requests.length, 0, "no request is sent");
   } finally {
     await stop(harness);
   }
