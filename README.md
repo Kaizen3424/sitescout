@@ -16,7 +16,7 @@ For every URL you get one of five verdicts:
 
 ## How to run
 
-Open PowerShell in this folder.
+Open PowerShell in the `cli` folder.
 
 First time only: install the two libraries and create your `.env` file (see
 [API keys](#api-keys) below).
@@ -98,11 +98,11 @@ The API has two doors:
 ## Reading the one-line output
 
 ```
-REACH_OUT need 0.85  q  1.1/10  https://arngren.net/  - the overall design looks dated; the layout is cluttered
+REACH_OUT need 0.85  vis  1.1/10  https://arngren.net/  - the design looks dated or unappealing at first glance
 ```
 
 - **need** = redesign need, 0 to 1. `0.60` and above is `REACH_OUT`, `0.40-0.60` is `MAYBE`.
-- **q** = design quality, 0 to 10.
+- **vis** = visual appeal, 0 to 10. It is the first of the three grades and drives 60% of the score.
 - Everything after the `-` is the main reason or the strongest talking point.
 
 Useful flags:
@@ -113,6 +113,7 @@ Useful flags:
 | `--json`        | Print JSON instead.                                              |
 | `-w 1`          | One site at a time (best on slow / mobile internet).             |
 | `--fresh`       | Ignore the cache: re-scrape the site and ask Gemini again.       |
+| `--rank`        | After a batch, sort the results by redesign need (highest first). |
 | `--out FILE`    | Write the report somewhere else (default `report.json`).         |
 | `--no-save`     | Do not write a report file.                                      |
 | `--calibrate CSV` | Score a CSV of `url,label` (`reach_out`/`skip`) to check accuracy. |
@@ -124,14 +125,16 @@ Useful flags:
 
 1. **Firecrawl** makes one full-page screenshot of the homepage and returns the HTML.
 2. **Gemini Decisions** answers three small, focused sets of questions about the screenshot:
-   - the six design scores (modernity, layout, typography, imagery, offer, trust),
+   - the three design grades (visual appeal, navigation, professional look),
    - the design verdict (outdated? unprofessional? which era?),
    - page checks (broken/blank, placeholder, small local business, popup, category).
 3. **HTML checks** add hard technical signals: no HTTPS, no mobile viewport, old
    jQuery/Bootstrap, table layout, stale copyright year, etc.
-4. The redesign need combines the design quality, "looks outdated", "looks
-   unprofessional" and the technical signals. The reported confidence comes from
-   the decisive yes/no answers, not from the soft 1-10 ratings.
+4. The redesign need is **60% visual appeal + 20% navigation + 20% professional
+   look**, plus at most **0.10** for the technical signals. The model picks the
+   three grades; the numbers are calculated in code, so the same grades always
+   produce the same score. The reported confidence comes from the decisive
+   yes/no and choice answers, not from the grades.
 
 Splitting the questions into three calls is deliberate: the decision model gets
 noticeably more confident when asked fewer things at once.
@@ -199,21 +202,24 @@ It will show `UNSCORED` or `SITE_DOWN` with the reason. Check it manually.
 
 ## Files
 
-| File              | Purpose                                                     |
-|-------------------|-------------------------------------------------------------|
-| `sitescout.py`    | Start here - thin launcher.                                 |
-| `cli.py`          | Command line, batch/interactive runs, calibration.          |
-| `capture.py`      | Firecrawl scrape + screenshot cache.                        |
-| `decisions.py`    | Gemini questions, screenshot shrinking, answer cache.       |
-| `scoring.py`      | Verdict, need score, confidence, talking points.            |
-| `htmlchecks.py`   | Technical checks on the HTML and contact details.           |
-| `reporting.py`    | One-line output, full report, `report.json`.                |
-| `config.py`       | Settings and environment variables.                         |
-| `httpio.py`       | HTTP retries and API-key rotation.                          |
-| `keypool.py`      | Key health (cooldowns, retired keys).                       |
-| `urls.py`         | URL cleaning and HTTP sessions.                             |
-| `api/`            | TypeScript HTTP API for Vercel (see `api/README.md`).        |
-| `web/`            | The public page: paste URLs, come back for the reports.     |
-| `AGENTS.md`       | Short project context for AI coding agents.                  |
-| `.env`            | Your API keys (secrets, not shared).                        |
-| `.env.example`    | Template showing which settings you can put in `.env`.      |
+The Python code lives in the `cli/` folder. Use it to test and iterate; once a
+change is final, port it to `api/` and deploy.
+
+| File                  | Purpose                                                     |
+|-----------------------|-------------------------------------------------------------|
+| `cli/sitescout.py`    | Start here - thin launcher.                                 |
+| `cli/cli.py`          | Command line, batch/interactive runs, calibration.          |
+| `cli/capture.py`      | Firecrawl scrape + screenshot cache.                        |
+| `cli/decisions.py`    | Gemini questions, screenshot shrinking, answer cache.       |
+| `cli/scoring.py`      | Three grades, need score, confidence, talking points.       |
+| `cli/htmlchecks.py`   | Technical checks on the HTML and contact details.           |
+| `cli/reporting.py`    | One-line output, full report, `report.json`.                |
+| `cli/config.py`       | Settings and environment variables.                         |
+| `cli/httpio.py`       | HTTP retries and API-key rotation.                          |
+| `cli/keypool.py`      | Key health (cooldowns, retired keys).                       |
+| `cli/urls.py`         | URL cleaning and HTTP sessions.                             |
+| `api/`                | TypeScript HTTP API for Vercel (see `api/README.md`).        |
+| `web/`                | The public page: paste URLs, come back for the reports.     |
+| `AGENTS.md`           | Short project context for AI coding agents.                  |
+| `cli/.env`            | Your API keys (secrets, not shared).                        |
+| `cli/.env.example`    | Template showing which settings you can put in `.env`.      |

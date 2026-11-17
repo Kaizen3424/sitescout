@@ -28,12 +28,9 @@ const STATUS_LABELS = {
 };
 
 const SCORE_LABELS = {
-  visual_modernity: "Visual modernity",
-  layout_hierarchy: "Layout & hierarchy",
-  typography_readability: "Typography",
-  imagery_quality: "Imagery",
-  conversion_clarity: "Offer & call-to-action",
-  trust_professionalism: "Professional / trust",
+  visual: "Visual appeal",
+  navigation: "Navigation",
+  credibility: "Professional look",
 };
 
 const state = {
@@ -80,6 +77,23 @@ function hostOf(url) {
     return new URL(url).hostname.replace(/^www\./, "");
   } catch {
     return String(url).replace(/^https?:\/\//i, "").replace(/^www\./, "").split("/")[0] || url;
+  }
+}
+
+/** A safe absolute link for the "Open" button, even if the input had no scheme. */
+function siteHref(url) {
+  const raw = String(url ?? "").trim();
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") return parsed.href;
+  } catch {
+    // no scheme: try https below
+  }
+  try {
+    return new URL(`https://${raw.replace(/^\/+/, "")}`).href;
+  } catch {
+    return "";
   }
 }
 
@@ -596,14 +610,35 @@ function resultNode(report) {
   const url = report.final_url || report.input_url || "";
   const key = url;
   const hasScore = typeof report.need_score === "number";
+  const visual = report.scores?.visual?.score_0_to_10;
   const scoreText = hasScore
-    ? `need ${num(report.need_score)} · design ${num(report.design_quality * 10, 1)}/10`
+    ? `need ${num(report.need_score)} · ${
+        typeof visual === "number"
+          ? `visual ${num(visual, 1)}/10`
+          : `design ${num(report.design_quality * 10, 1)}/10`
+      }`
     : "not scored";
+
+  const href = siteHref(url);
+  const openLink = href
+    ? el("a", {
+        class: "result-open",
+        href,
+        target: "_blank",
+        rel: "noopener noreferrer",
+        title: "Open website in a new tab",
+        "aria-label": `Open ${url} in a new tab`,
+        text: "Open ↗",
+        // Without this, clicking the link would also fold/unfold the result.
+        onclick: (event) => event.stopPropagation(),
+      })
+    : null;
 
   const summary = el("summary", {}, [
     el("span", { class: "verdict-tag", "data-tone": verdict.tone, text: verdict.label }),
     el("span", { class: "result-url", text: url, title: url }),
     el("span", { class: "result-score", text: scoreText }),
+    openLink,
   ]);
 
   const body = el("div", { class: "result-body" }, resultSections(report));
@@ -637,8 +672,16 @@ function resultSections(report) {
 
   const meta = [];
   if (typeof report.need_score === "number") {
+    const visual = report.scores?.visual?.score_0_to_10;
     meta.push(kv("Redesign need", `${num(report.need_score)} / 1.00`));
-    meta.push(kv("Design quality", `${num(report.design_quality * 10, 1)} / 10`));
+    meta.push(
+      kv(
+        "Visual appeal",
+        typeof visual === "number"
+          ? `${num(visual, 1)} / 10`
+          : `${num(report.design_quality * 10, 1)} / 10`,
+      ),
+    );
     meta.push(kv("Model confidence", `${num((report.model_confidence ?? 0) * 100, 0)}%`));
   }
   if (report.design_era?.name) meta.push(kv("Design era", report.design_era.name));
@@ -667,8 +710,19 @@ function resultSections(report) {
       .map((key) => {
         const value = Number(scores[key].score_0_to_10) || 0;
         const tone = toneForScore(value);
+        const detail = [
+          scores[key].label,
+          typeof scores[key].confidence === "number"
+            ? `${Math.round(scores[key].confidence * 100)}%`
+            : "",
+        ]
+          .filter(Boolean)
+          .join(" · ");
         return el("div", { class: "scale-row" }, [
-          el("span", { text: SCORE_LABELS[key] }),
+          el("span", {}, [
+            el("span", { text: SCORE_LABELS[key] }),
+            detail ? el("span", { class: "grade-name", text: detail }) : null,
+          ]),
           el("span", { class: "scale-bar" }, [
             el("span", {
               "data-tone": tone,
@@ -678,7 +732,9 @@ function resultSections(report) {
           el("span", { class: "value", text: value.toFixed(1) }),
         ]);
       });
-    if (rows.length > 0) sections.push(section("Design scores (0–10)", el("div", { class: "scale" }, rows)));
+    if (rows.length > 0) {
+      sections.push(section("Design grades (0–10, higher = better)", el("div", { class: "scale" }, rows)));
+    }
   }
 
   const issues = (report.issues ?? []).filter((issue) => issue && issue.label);

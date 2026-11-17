@@ -76,6 +76,7 @@ def http_request_with_keys(
     timeout: Any,
     label: str,
     max_key_wait: float = 180.0,
+    max_key_attempts: Optional[int] = None,
     **kwargs: Any,
 ) -> requests.Response:
     """Like `http_request` but rotates API keys on auth/rate-limit failures.
@@ -99,6 +100,11 @@ def http_request_with_keys(
     waited = 0.0
 
     while True:
+        if max_key_attempts is not None and len(tried) >= max_key_attempts:
+            log.warning("%s: %d keys rejected without success - giving up", label, len(tried))
+            if last_resp is not None:
+                return last_resp
+            raise NetworkError(f"{label}: no API key worked after {len(tried)} attempts")
         try:
             key = key_pool.pick(exclude=tried)
         except FatalAPIError:

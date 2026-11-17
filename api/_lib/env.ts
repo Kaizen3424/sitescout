@@ -1,7 +1,7 @@
 /** Settings: everything configurable through environment variables. */
 import { ConfigError } from "./errors.js";
 
-export const API_VERSION = "1.0.0";
+export const API_VERSION = "1.1.0";
 export const USER_AGENT = "sitescout-api/1.0";
 
 export type ImageResolution = "low" | "medium" | "high" | "ultra_high";

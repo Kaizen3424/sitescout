@@ -34,13 +34,15 @@ def public_report(report: dict) -> dict:
 
 
 def render_one_line(r: dict, color: bool) -> str:
-    """Compact single line: VERDICT  need  q  url  - top issue(s) or reason."""
+    """Compact single line: VERDICT  need  vis  url  - top issue(s) or reason."""
     v = r["verdict"]
     url = r.get("final_url") or r["input_url"]
     head = _c(f"{v:<9}", _COLORS.get(v, "0") + ";1", color)
     if "need_score" in r:
         issues = [i["label"] for i in (r.get("issues") or [])[:2]]
-        line = f"{head} need {r['need_score']:.2f}  q {r['design_quality'] * 10:4.1f}/10  {url}"
+        visual = (r.get("scores") or {}).get("visual", {}).get("score_0_to_10")
+        shown = f"{visual:4.1f}/10" if isinstance(visual, (int, float)) else f"{r['design_quality'] * 10:4.1f}/10"
+        line = f"{head} need {r['need_score']:.2f}  vis {shown}  {url}"
         if issues:
             line += "  - " + "; ".join(issues)
     else:
@@ -66,6 +68,10 @@ def render_report(r: dict, color: bool) -> str:
     if "need_score" in r:
         L.append(f"VERDICT   : {head}   (redesign need {r['need_score']:.2f} | design quality "
                  f"{r['design_quality']:.2f} | model confidence {r['model_confidence']:.2f})")
+        parts = r.get("need_parts") or {}
+        if parts:
+            bits = " + ".join(f"{k} {val:.2f}" for k, val in parts.items() if val)
+            L.append(f"NEED      : {r['need_score']:.2f}  =  {bits}")
     else:
         L.append(f"VERDICT   : {head}")
     L.append("")
@@ -74,11 +80,12 @@ def render_report(r: dict, color: bool) -> str:
         L.append(f"  - {s}")
     if r.get("scores"):
         L.append("")
-        L.append("Design scores (0-10, higher = better)")
+        L.append("Design grades (0-10, higher = better)")
         for k in SCORE_KEYS:
             s = r["scores"][k]
-            L.append(f"  {SCORE_LABELS[k]:<24} {_bar(s['score_0_to_10'] / 10)} {s['score_0_to_10']:>4.1f}"
-                     f"   (conf {s['confidence']:.2f})")
+            label = s.get("label") or s.get("grade") or ""
+            L.append(f"  {SCORE_LABELS[k]:<18} {_bar(s['score_0_to_10'] / 10)} {s['score_0_to_10']:>4.1f}"
+                     f"   {label} (conf {s['confidence']:.2f})")
         p = r["probabilities"]
         L.append(f"  P(outdated)={p['outdated']:.2f}  P(unprofessional)={p['unprofessional']:.2f}  "
                  f"design era ~ {r['design_era']['name']}")
@@ -126,6 +133,25 @@ def render_report(r: dict, color: bool) -> str:
         L.extend(f"  ! {w}" for w in r["warnings"])
     L.append("=" * 64)
     return "\n".join(L)
+
+
+def render_rank(reports: list[dict]) -> str:
+    """Sorted table for batch runs: highest redesign need first."""
+    scored = [r for r in reports if isinstance(r.get("need_score"), (int, float))]
+    scored.sort(key=lambda r: r["need_score"], reverse=True)
+    if not scored:
+        return "No scored URLs to rank."
+
+    def grade(r: dict, key: str) -> str:
+        value = (r.get("scores") or {}).get(key, {}).get("score_0_to_10")
+        return f"{value:>4.1f}" if isinstance(value, (int, float)) else "   -"
+
+    lines = [f"{'need':>5}  {'vis':>4}  {'nav':>4}  {'cred':>4}  {'verdict':<9}  url"]
+    for r in scored:
+        url = r.get("final_url") or r["input_url"]
+        lines.append(f"{r['need_score']:>5.2f}  {grade(r, 'visual')}  {grade(r, 'navigation')}  "
+                     f"{grade(r, 'credibility')}  {r['verdict']:<9}  {url}")
+    return "\n".join(lines)
 
 
 def save_reports(cfg, reports: list[dict]) -> Optional[Path]:

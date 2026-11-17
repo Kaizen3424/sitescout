@@ -1,6 +1,8 @@
 # Secrets
 .env
 .env.local
+cli/openrouter.txt
+cli/morphllm.txt
 
 # Python
 __pycache__/
@@ -13,6 +15,7 @@ node_modules/
 
 # Output
 report.json
+report_*.json
 
 # Backups (the old monolith contained a key)
 *.bak

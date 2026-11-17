@@ -45,11 +45,16 @@ the same field names as the CLI's `report.json`:
     {
       "input_url": "https://arngren.net",
       "verdict": "REACH_OUT",
-      "need_score": 0.86,
-      "design_quality": 0.104,
+      "need_score": 0.79,
+      "design_quality": 0.26,
+      "need_parts": { "visual": 0.48, "navigation": 0.1, "credibility": 0.16, "signals": 0.05 },
       "image": { "mime": "image/png", "width": 1440, "height": 2587, "bytes": 4066507 },
-      "scores": { "visual_modernity": { "score_0_to_10": 1.2, "confidence": 0.91 } },
-      "reasons": ["Redesign need 0.86 is above the reach-out threshold (0.60)."],
+      "scores": {
+        "visual": { "score_0_to_10": 2.0, "confidence": 0.91, "grade": "dated", "label": "Clearly dated" },
+        "navigation": { "score_0_to_10": 5.0, "confidence": 0.84, "grade": "workable", "label": "Workable" },
+        "credibility": { "score_0_to_10": 2.0, "confidence": 0.88, "grade": "weak", "label": "Weak" }
+      },
+      "reasons": ["Redesign need 0.79 is above the reach-out threshold (0.60)."],
       "issues": [{ "label": "...", "phrase": "...", "severity": 0.9 }]
     }
   ],
@@ -57,6 +62,10 @@ the same field names as the CLI's `report.json`:
   "elapsed_s": 61.2
 }
 ```
+
+The three design grades are **visual appeal**, **navigation** and **professional
+look**, combined **60/20/20**. Technical HTML flags add at most **0.10**; they
+never reduce a score. `need_parts` shows that arithmetic per report.
 
 A failing URL returns `UNSCORED` or `SITE_DOWN` with a reason; it never fails the
 whole batch. Status codes: `400` bad body, `401` bad token, `404` unknown path,

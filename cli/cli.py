@@ -22,7 +22,8 @@ from config import Config, load_config, load_dotenv
 from decisions import DecisionError, run_decisions
 from errors import FatalAPIError, InvalidURL, SiteScoutError
 from htmlchecks import analyze_html, guess_business_name
-from reporting import _base_report, public_report, render_one_line, render_report, save_reports
+from reporting import (_base_report, public_report, render_one_line, render_rank,
+                       render_report, save_reports)
 from scoring import evaluate, outreach_opening
 from urls import _new_session, _worker_session, normalize_url
 
@@ -65,17 +66,15 @@ def analyze(url_in: str, cfg: Config, session: requests.Session, fresh: bool = F
     except (CaptureError, DecisionError) as exc:
         report["reasons"].append(f"Could not score the design: {exc}")
         if isinstance(exc, DecisionError) and exc.kind == "safety":
-            report["reasons"].append("Gemini's safety filter blocked the screenshot.")
+            report["reasons"].append("The model's safety filter blocked the screenshot.")
         elif isinstance(exc, DecisionError) and exc.kind == "quota":
-            report["reasons"].append("The free Gemini quota is used up for now. Re-run this URL later "
+            report["reasons"].append("The decision provider's quota is used up for now. Re-run this URL later "
                                      "(in an hour or tomorrow): the question groups already answered are cached, "
                                      "so the retry only pays for what is missing.")
         return report
 
     ev = evaluate(cfg, model_out, signals)
     report.update(ev)
-    report["scores"] = {k: {"score_0_to_10": round(v["norm"] * 10, 1), "confidence": round(v["confidence"], 3)}
-                        for k, v in model_out["scores"].items()}
     report["model_usage"] = model_out.get("usage")
     report["outreach"] = {"best_contact": signals.get("contact", {}).get("best"),
                           "opening_line": outreach_opening(report["business"]["name"], host, ev["issues"])
@@ -164,6 +163,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="print JSON instead of the readable report")
     p.add_argument("--full", action="store_true",
                    help="batch mode: print the full report for each URL instead of one line")
+    p.add_argument("--rank", action="store_true",
+                   help="after a batch, print the results sorted by redesign need (highest first)")
     p.add_argument("--fresh", action="store_true",
                    help="ignore all caches (screenshot and Gemini answers) and start over")
     p.add_argument("--no-save", action="store_true", help="don't write the report.json file")
@@ -220,7 +221,7 @@ def _run_batch(urls: list[str], cfg: Config, args: argparse.Namespace, color: bo
         args.full = True  # a lone URL deserves the detailed report
     reports: list[Optional[dict]] = [None] * len(urls)
     if not args.json and not args.full:
-        print("(one line per site: verdict | need = redesign need 0-1 | q = design quality 0-10)",
+        print("(one line per site: verdict | need = redesign need 0-1 | vis = visual appeal 0-10)",
               file=sys.stderr)
 
     if workers == 1:
@@ -263,6 +264,9 @@ def _run_batch(urls: list[str], cfg: Config, args: argparse.Namespace, color: bo
         out = [public_report(r) for r in reports]
         print(json.dumps(out[0] if len(out) == 1 else out, indent=2, ensure_ascii=False))
     else:
+        if args.rank and not single:
+            print()
+            print(render_rank([public_report(r) for r in reports]))
         if not single:
             print(f"\nTotals: {_totals_line(reports)}")
         if saved:

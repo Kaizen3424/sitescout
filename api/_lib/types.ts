@@ -76,13 +76,31 @@ export interface Issue {
   severity: number;
 }
 
+export interface GradeScore {
+  score_0_to_10: number;
+  confidence: number;
+  grade: string;
+  label: string;
+  probabilities: Record<string, number>;
+}
+
+export interface NeedParts {
+  visual: number;
+  navigation: number;
+  credibility: number;
+  signals: number;
+}
+
 export interface Evaluation {
   verdict: Verdict;
   need_score: number;
   need_model: number;
   need_signals: number;
+  need_parts: NeedParts;
   design_quality: number;
   model_confidence: number;
+  design_confidence: number;
+  scores: Record<string, GradeScore>;
   probabilities: {
     outdated: number;
     unprofessional: number;

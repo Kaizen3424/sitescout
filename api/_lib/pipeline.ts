@@ -106,12 +106,6 @@ export async function analyzeUrl(
 
   const evaluation = evaluate(settings, modelOut, signals);
   Object.assign(report, evaluation);
-  report.scores = Object.fromEntries(
-    Object.entries(modelOut.scores).map(([key, value]) => [
-      key,
-      { score_0_to_10: Math.round(value.norm * 100) / 10, confidence: Math.round(value.confidence * 1000) / 1000 },
-    ]),
-  );
   report.model_usage = modelOut.usage;
   report.model_cached = modelOut.fromCache;
   report.outreach = {

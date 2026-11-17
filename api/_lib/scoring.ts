@@ -1,45 +1,131 @@
 /**
  * Scoring: turn the model's answers plus HTML signals into a verdict,
  * talking points and a draft opening line. Port of the Python `scoring.py`.
+ *
+ * The design judgement is three graded choices (visual / navigation /
+ * credibility) and a fixed 60/20/20 formula. The model picks the grade; the
+ * arithmetic happens here, so two sites with the same grades always get the
+ * same score.
  */
 import type { Settings } from "./env.js";
-import type { Evaluation, HtmlSignals, Issue, ParsedAnswers, Verdict } from "./types.js";
+import type {
+  ChoiceAnswer,
+  Evaluation,
+  GradeScore,
+  HtmlSignals,
+  Issue,
+  ParsedAnswers,
+  Verdict,
+} from "./types.js";
 
-export const SCORE_KEYS = [
-  "visual_modernity",
-  "layout_hierarchy",
-  "typography_readability",
-  "imagery_quality",
-  "conversion_clarity",
-  "trust_professionalism",
-] as const;
+export const GRADE_KEYS = ["visual", "navigation", "credibility"] as const;
+export type GradeKey = (typeof GRADE_KEYS)[number];
 
-export const SCORE_WEIGHTS: Record<(typeof SCORE_KEYS)[number], number> = {
-  visual_modernity: 0.3,
-  layout_hierarchy: 0.2,
-  typography_readability: 0.15,
-  imagery_quality: 0.15,
-  conversion_clarity: 0.1,
-  trust_professionalism: 0.1,
+export const GRADE_WEIGHTS: Record<GradeKey, number> = {
+  visual: 0.6,
+  navigation: 0.2,
+  credibility: 0.2,
 };
 
-export const SCORE_LABELS: Record<(typeof SCORE_KEYS)[number], string> = {
-  visual_modernity: "Visual modernity",
-  layout_hierarchy: "Layout & hierarchy",
-  typography_readability: "Typography",
-  imagery_quality: "Imagery",
-  conversion_clarity: "Offer & call-to-action",
-  trust_professionalism: "Professional / trust",
+export const GRADE_LABELS: Record<GradeKey, string> = {
+  visual: "Visual appeal",
+  navigation: "Navigation",
+  credibility: "Professional look",
 };
 
-const DIM_ISSUES: Record<(typeof SCORE_KEYS)[number], [string, string]> = {
-  visual_modernity: ["the overall design looks dated", "the design looks a few years behind current standards"],
-  layout_hierarchy: ["the layout is cluttered or hard to scan", "the layout is hard to scan, so visitors may not find what they need"],
-  typography_readability: ["text styling hurts readability", "the text styling makes the content harder to read than it should be"],
-  imagery_quality: ["images are low quality or poorly used", "the imagery looks low-quality, which weakens first impressions"],
-  conversion_clarity: ["the offer / next step is unclear", "it isn't immediately clear what to do next (call, book, order)"],
-  trust_professionalism: ["the site doesn't project a professional image", "the site may not be projecting the professional image the business deserves"],
+// How far each grade is from a current best-practice website:
+// 0.0 = already there, 1.0 = completely off.
+export const GRADE_GAPS: Record<GradeKey, Record<string, number>> = {
+  visual: { premium: 0, contemporary: 0.2, dated_tidy: 0.5, dated: 0.8, poor: 1 },
+  navigation: { effortless: 0, clear: 0.2, workable: 0.5, confusing: 0.8, lost: 1 },
+  credibility: { excellent: 0, good: 0.2, ordinary: 0.5, weak: 0.8, amateur: 1 },
 };
+
+export const GRADE_NAMES: Record<GradeKey, Record<string, string>> = {
+  visual: {
+    premium: "Premium",
+    contemporary: "Contemporary template",
+    dated_tidy: "Tidy but dated",
+    dated: "Clearly dated",
+    poor: "Poor / off-putting",
+  },
+  navigation: {
+    effortless: "Effortless",
+    clear: "Clear",
+    workable: "Workable",
+    confusing: "Confusing",
+    lost: "Lost",
+  },
+  credibility: {
+    excellent: "Excellent",
+    good: "Good",
+    ordinary: "Ordinary",
+    weak: "Weak",
+    amateur: "Amateur",
+  },
+};
+
+export const GRADE_ISSUES: Record<GradeKey, [string, string]> = {
+  visual: [
+    "the design looks dated or unappealing at first glance",
+    "the site doesn't look as good as the business deserves",
+  ],
+  navigation: [
+    "visitors have to hunt for key information",
+    "it isn't obvious where to find the properties, services or contact details",
+  ],
+  credibility: [
+    "the site doesn't project a professional image",
+    "the site may not be projecting the professional image the business deserves",
+  ],
+};
+
+// Kept as aliases so reporting and the web interface share one vocabulary.
+export const SCORE_KEYS = GRADE_KEYS;
+export const SCORE_LABELS = GRADE_LABELS;
+
+export const SIGNAL_SHARE = 0.1; // technical HTML flags are a small bonus, not a reweighting
+
+export function choiceKey(grade: GradeKey): string {
+  return `${grade}_grade`;
+}
+
+export function expectedGap(answer: ChoiceAnswer, gaps: Record<string, number>): number {
+  /** Probability-weighted distance from a current best-practice website. */
+  const probabilities = answer.probabilities ?? {};
+  const mass = Object.values(probabilities).reduce((sum, value) => sum + value, 0);
+  let total: number;
+  if (mass > 0) {
+    total =
+      Object.entries(probabilities).reduce(
+        (sum, [level, p]) => sum + p * (gaps[level] ?? 0),
+        0,
+      ) / mass;
+  } else {
+    total = gaps[answer.choice] ?? 0.5;
+  }
+  return Math.min(1, Math.max(0, total));
+}
+
+export interface GradeScoring {
+  gaps: Record<GradeKey, number>;
+  parts: Record<GradeKey, number>;
+  need_model: number;
+}
+
+export function scoreFromGrades(choices: ParsedAnswers["choices"]): GradeScoring {
+  /** Pure function: the three grade answers -> gaps, weighted parts, need. */
+  const gaps: Record<GradeKey, number> = { visual: 0, navigation: 0, credibility: 0 };
+  const parts: Record<GradeKey, number> = { visual: 0, navigation: 0, credibility: 0 };
+  for (const key of GRADE_KEYS) {
+    const answer = choices[choiceKey(key)];
+    if (!answer) throw new Error(`missing answer '${choiceKey(key)}'`);
+    gaps[key] = expectedGap(answer, GRADE_GAPS[key]);
+    parts[key] = GRADE_WEIGHTS[key] * gaps[key];
+  }
+  const needModel = GRADE_KEYS.reduce((sum, key) => sum + parts[key], 0);
+  return { gaps, parts, need_model: needModel };
+}
 
 function median(values: number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
@@ -47,27 +133,24 @@ function median(values: number[]): number {
   return sorted.length % 2 === 0 ? (sorted[middle - 1]! + sorted[middle]!) / 2 : sorted[middle]!;
 }
 
+const round3 = (n: number): number => Math.round(n * 1000) / 1000;
+const round2 = (n: number): number => Math.round(n * 100) / 100;
+const round1 = (n: number): number => Math.round(n * 10) / 10;
+
 export function evaluate(settings: Settings, model: ParsedAnswers, signals: HtmlSignals): Evaluation {
-  const { scores, yesno: yn, choices: ch } = model;
+  const { yesno: yn, choices: ch } = model;
+  const { gaps, parts, need_model: needModel } = scoreFromGrades(ch);
 
-  const quality =
-    SCORE_KEYS.reduce((sum, key) => sum + SCORE_WEIGHTS[key] * scores[key]!.norm, 0) /
-    SCORE_KEYS.reduce((sum, key) => sum + SCORE_WEIGHTS[key], 0);
+  const flags = signals.flags;
+  const needSignals = Math.min(1, flags.reduce((sum, flag) => sum + flag.weight, 0));
+  // Technical flags add a small amount; a site with no flags is not penalised
+  // for the missing signal (the old 80/20 blend silently shrank every score).
+  const need = Math.min(1, needModel + (signals.available ? SIGNAL_SHARE * needSignals : 0));
+  const designQuality = 1 - needModel;
 
-  const pOut = yn.looks_outdated!.p;
-  const pUnp = yn.looks_unprofessional!.p;
-  const era = ch.design_era!.probabilities;
-  const pOldEra = (era.before_2012 ?? 0) + (era["2012_2017"] ?? 0);
-
-  // "Looks unprofessional" is the strongest human signal, so it carries a bit
-  // more weight than the era guess.
-  const needModel = 0.5 * (1 - quality) + 0.2 * pOut + 0.2 * pUnp + 0.1 * pOldEra;
-  const needSignals = Math.min(1, signals.flags.reduce((sum, f) => sum + f.weight, 0));
-  const need = signals.available ? 0.8 * needModel + 0.2 * needSignals : needModel;
-
-  // Confidence of the verdict comes from the DECISIVE questions (yes/no +
-  // choices), which the focused calls answer with high confidence. The graded
-  // scores are naturally softer and are therefore not part of this number.
+  // Confidence of the verdict comes from the DECISIVE gate questions. The
+  // design grade gets its own confidence: a confident "small business" answer
+  // says nothing about how sure the model is of its visual judgement.
   const confidence = median([
     yn.looks_outdated!.confidence,
     yn.looks_unprofessional!.confidence,
@@ -78,11 +161,19 @@ export function evaluate(settings: Settings, model: ParsedAnswers, signals: Html
     ch.design_era!.confidence,
     ch.business_category!.confidence,
   ]);
+  const designConfidence = GRADE_KEYS.reduce(
+    (sum, key) => sum + GRADE_WEIGHTS[key] * ch[choiceKey(key)]!.confidence,
+    0,
+  );
 
   const pBroken = yn.page_is_broken_or_blank!.p;
   const pPlace = yn.is_placeholder_page!.p;
   const pLocal = yn.is_small_local_business!.p;
   const pOverlay = yn.obscured_by_overlay!.p;
+  const pOut = yn.looks_outdated!.p;
+  const pUnp = yn.looks_unprofessional!.p;
+  const era = ch.design_era!.probabilities;
+  const pOldEra = (era.before_2012 ?? 0) + (era["2012_2017"] ?? 0);
 
   const reasons: string[] = [];
   const warnings: string[] = [];
@@ -161,6 +252,12 @@ export function evaluate(settings: Settings, model: ParsedAnswers, signals: Html
   if (pPlace > 0.7 && verdict !== "UNSCORED") {
     warnings.push("Page looks like a placeholder / under-construction page.");
   }
+  if (designConfidence < 0.5 && verdict !== "UNSCORED") {
+    warnings.push(
+      `The design grade is uncertain (weighted confidence ${designConfidence.toFixed(2)}); ` +
+        "look at the saved screenshot before acting on it.",
+    );
+  }
   if (signals.available && !signals.contact.best) {
     warnings.push(
       "No contact route found on the homepage: check the contact page, Google Business Profile " +
@@ -171,19 +268,19 @@ export function evaluate(settings: Settings, model: ParsedAnswers, signals: Html
     warnings.push(signals.note ?? "HTML signals unavailable");
   }
 
-  // talking points: weakest design dimensions + technical flags, strongest first
+  // talking points: weakest design grades + technical flags, strongest first
   const issues: Issue[] = [];
-  for (const key of SCORE_KEYS) {
-    const norm = scores[key]!.norm;
-    if (norm < 0.4) {
-      issues.push({ label: DIM_ISSUES[key][0], phrase: DIM_ISSUES[key][1], severity: Math.round((1 - norm) * 100) / 100 });
+  for (const key of GRADE_KEYS) {
+    const gap = gaps[key];
+    if (gap >= 0.4) {
+      issues.push({ label: GRADE_ISSUES[key][0], phrase: GRADE_ISSUES[key][1], severity: round2(gap) });
     }
   }
   const severityScale: Record<string, number> = {
     no_https: 0.85, no_viewport: 0.9, legacy_tech: 0.7, table_layout: 0.65,
     legacy_generator: 0.55, stale_copyright: 0.5, old_libs: 0.45, legacy_doctype: 0.3,
   };
-  for (const flag of signals.flags) {
+  for (const flag of flags) {
     issues.push({
       label: flag.label,
       phrase: flag.phrase,
@@ -192,31 +289,53 @@ export function evaluate(settings: Settings, model: ParsedAnswers, signals: Html
   }
   issues.sort((a, b) => b.severity - a.severity);
 
+  const scores: Record<string, GradeScore> = {};
+  for (const key of GRADE_KEYS) {
+    const grade = ch[choiceKey(key)]!;
+    const choice = grade.choice;
+    scores[key] = {
+      score_0_to_10: round1((1 - gaps[key]) * 10),
+      confidence: round3(grade.confidence),
+      grade: choice,
+      label: GRADE_NAMES[key][choice] ?? choice,
+      probabilities: Object.fromEntries(
+        Object.entries(grade.probabilities ?? {}).map(([level, p]) => [level, round3(p)]),
+      ),
+    };
+  }
+
   const category = ch.business_category!;
   const designEra = ch.design_era!;
-  const round = (n: number): number => Math.round(n * 1000) / 1000;
 
   return {
     verdict,
-    need_score: round(need),
-    need_model: round(needModel),
-    need_signals: round(needSignals),
-    design_quality: round(quality),
-    model_confidence: round(confidence),
+    need_score: round3(need),
+    need_model: round3(needModel),
+    need_signals: round3(needSignals),
+    need_parts: {
+      visual: round3(parts.visual),
+      navigation: round3(parts.navigation),
+      credibility: round3(parts.credibility),
+      signals: signals.available ? round3(SIGNAL_SHARE * needSignals) : 0,
+    },
+    design_quality: round3(designQuality),
+    model_confidence: round3(confidence),
+    design_confidence: round3(designConfidence),
     probabilities: {
-      outdated: round(pOut),
-      unprofessional: round(pUnp),
-      old_era: round(pOldEra),
-      small_local_business: round(pLocal),
-      placeholder: round(pPlace),
-      overlay: round(pOverlay),
-      broken_or_blank: round(pBroken),
+      outdated: round3(pOut),
+      unprofessional: round3(pUnp),
+      old_era: round3(pOldEra),
+      small_local_business: round3(pLocal),
+      placeholder: round3(pPlace),
+      overlay: round3(pOverlay),
+      broken_or_blank: round3(pBroken),
     },
     reasons,
     warnings,
     issues,
-    category: { name: category.choice, confidence: round(category.confidence) },
-    design_era: { name: designEra.choice, confidence: round(designEra.confidence) },
+    category: { name: category.choice, confidence: round3(category.confidence) },
+    design_era: { name: designEra.choice, confidence: round3(designEra.confidence) },
+    scores,
   };
 }
 

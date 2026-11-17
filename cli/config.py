@@ -7,6 +7,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 from errors import ConfigError
 from keypool import KeyPool
@@ -30,8 +31,14 @@ def _env_num(name: str, default: float, cast=float):
 @dataclass(frozen=True)
 class Config:
     firecrawl_keys: KeyPool
-    gemini_keys: KeyPool
-    decision_model: str = "gemini-decision-1"
+    gemini_keys: Optional[KeyPool] = None
+    openrouter_keys: Optional[KeyPool] = None
+    morph_keys: Optional[KeyPool] = None
+    decision_provider: str = "gemini"  # gemini | openrouter | morph
+    decision_model: str = "gemini-decision-1"  # Google Decisions API
+    openrouter_model: str = "perplexity/pplx-decider-v1.3:free"  # OpenRouter Decisions model
+    morph_model: str = "reflex"  # Morph System One decision model
+    max_key_attempts: int = 5  # stop rotating after this many rejected provider keys
     viewport_w: int = 1440
     viewport_h: int = 900
     wait_for_ms: int = 2500
@@ -94,18 +101,64 @@ def _env_keys(*names: str) -> list[str]:
     return []
 
 
+def _read_key_file(path: Path) -> list[str]:
+    """Read API keys from a plain text file: one key per line (commas work too)."""
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except OSError:
+        return []
+    keys: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        for k in re.split(r"[,;\s]+", line):
+            if k and k not in keys:
+                keys.append(k)
+    return keys
+
+
 def load_config(args: argparse.Namespace) -> Config:
     fc_keys = _env_keys("FIRECRAWL_API_KEYS", "FIRECRAWL_API_KEY")
     gm_keys = _env_keys("GEMINI_API_KEYS", "GEMINI_API_KEY", "GOOGLE_API_KEY")
 
-    missing = [n for n, v in (("FIRECRAWL_API_KEYS", fc_keys), ("GEMINI_API_KEYS", gm_keys)) if not v]
+    provider = os.getenv("SITESCOUT_DECISION_PROVIDER", "gemini").strip().lower() or "gemini"
+    if provider not in {"gemini", "openrouter", "morph"}:
+        raise ConfigError("SITESCOUT_DECISION_PROVIDER must be 'gemini', 'openrouter' or 'morph' "
+                          f"(got {provider!r}).")
+
+    # OpenRouter keys come from the environment, or from cli/openrouter.txt
+    # (one key per line) so a large test pool is easy to manage without .env.
+    or_keys = _env_keys("OPENROUTER_API_KEYS")
+    if not or_keys:
+        default_file = Path(__file__).resolve().parent / "openrouter.txt"
+        key_file = Path(os.getenv("SITESCOUT_OPENROUTER_KEYS_FILE") or default_file)
+        or_keys = _read_key_file(key_file)
+
+    # Morph (System One / reflex) keys: extra_env or cli/morphllm.txt, same idea.
+    morph_keys = _env_keys("MORPH_API_KEYS", "MORPH_API_KEY")
+    if not morph_keys:
+        default_file = Path(__file__).resolve().parent / "morphllm.txt"
+        key_file = Path(os.getenv("SITESCOUT_MORPH_KEYS_FILE") or default_file)
+        morph_keys = _read_key_file(key_file)
+
+    required = [("FIRECRAWL_API_KEYS", fc_keys)]
+    if provider == "gemini":
+        required.append(("GEMINI_API_KEYS", gm_keys))
+    elif provider == "openrouter":
+        required.append(("OPENROUTER_API_KEYS (or cli/openrouter.txt)", or_keys))
+    else:
+        required.append(("MORPH_API_KEYS (or cli/morphllm.txt)", morph_keys))
+    missing = [n for n, v in required if not v]
     if missing:
         raise ConfigError(
             f"Missing API keys: {', '.join(missing)}. Create a .env file next to sitescout.py "
             "with one line per service (comma-separated for multiple keys):\n"
             "  FIRECRAWL_API_KEYS=fc-aaa,fc-bbb\n"
             "  GEMINI_API_KEYS=AIzaA,AIzaB\n"
-            "See .env.example for a template."
+            "For the OpenRouter provider set OPENROUTER_API_KEYS in .env, or put one key per line in "
+            "cli/openrouter.txt. For the Morph provider set MORPH_API_KEYS, or put one key per line in "
+            "cli/morphllm.txt. See .env.example for a template."
         )
 
     resolution = os.getenv("SITESCOUT_IMAGE_RESOLUTION", "high").strip().lower()
@@ -114,8 +167,15 @@ def load_config(args: argparse.Namespace) -> Config:
         resolution = "high"
     return Config(
         firecrawl_keys=KeyPool(fc_keys, "firecrawl"),
-        gemini_keys=KeyPool(gm_keys, "gemini"),
+        gemini_keys=KeyPool(gm_keys, "gemini") if gm_keys else None,
+        openrouter_keys=KeyPool(or_keys, "openrouter") if or_keys else None,
+        morph_keys=KeyPool(morph_keys, "morph") if morph_keys else None,
+        decision_provider=provider,
         decision_model=os.getenv("SITESCOUT_MODEL", "gemini-decision-1").strip() or "gemini-decision-1",
+        openrouter_model=os.getenv("SITESCOUT_OPENROUTER_MODEL", "perplexity/pplx-decider-v1.3:free").strip()
+        or "perplexity/pplx-decider-v1.3:free",
+        morph_model=os.getenv("SITESCOUT_MORPH_MODEL", "reflex").strip() or "reflex",
+        max_key_attempts=_env_num("SITESCOUT_MAX_KEY_ATTEMPTS", 5, int),
         viewport_w=_env_num("SITESCOUT_VIEWPORT_W", 1440, int),
         viewport_h=_env_num("SITESCOUT_VIEWPORT_H", 900, int),
         wait_for_ms=_env_num("SITESCOUT_WAIT_MS", 2500, int),

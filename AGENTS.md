@@ -8,13 +8,16 @@ That is what allows the API to run on Vercel's free Hobby plan.
 
 | Part | Where | What |
 |------|-------|------|
-| Python CLI | repo root (`sitescout.py`, `cli.py`, ...) | Local batch tool, one line per site, writes one `report.json`. |
+| Python CLI | `cli/` (`sitescout.py`, `cli.py`, ...) | Local batch tool, one line per site, writes one `report.json`. |
 | TypeScript API | `api/` | HTTP wrapper around the same pipeline, deployed on Vercel. |
 | Web interface | `web/` | Static page at `/`: paste 1–50 URLs, close the browser, come back for the reports. |
 
 The CLI is the reference implementation. The API must produce the same verdicts
 and the same report field names. The page has no build step and no framework:
 plain HTML, CSS and one ES module.
+
+Workflow: test and iterate in `cli/`; once a change is finalised, port it to
+`api/` and deploy.
 
 **Production:** https://sitescout-dusky.vercel.app — the page at `/`, the JSON
 index at `/v1`. Deployed from the `main` branch of
@@ -45,12 +48,15 @@ index at `/v1`. Deployed from the `main` branch of
 ## Commands
 
 ```powershell
-python sitescout.py https://example.com     # CLI, one site
+python cli/sitescout.py https://example.com  # CLI, one site (from repo root)
 npx tsc --noEmit                            # type-check the API
 node --check web/app.js                     # syntax-check the page's script
 vercel dev                                  # API + page locally (needs login/link)
 vercel --prod                               # deploy
 ```
+
+Or `cd cli` first and run `python sitescout.py ...` — both work. The CLI reads
+its keys from `cli/.env`; `report.json` lands in the folder you run from.
 
 `vercel dev` needs Redis/QStash credentials for the batch form. For a quick local
 run without a public callback URL:

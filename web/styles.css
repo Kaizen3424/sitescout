@@ -780,6 +780,32 @@ textarea:disabled {
   white-space: nowrap;
 }
 
+.result-open {
+  flex: none;
+  padding: 0.2rem 0.55rem;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  background: #fff;
+  color: var(--ink-soft);
+  font-size: 0.72rem;
+  font-weight: 600;
+  line-height: 1.4;
+  text-decoration: none;
+  white-space: nowrap;
+  transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.result-open:hover {
+  border-color: var(--rule-strong);
+  background: var(--paper-sunken);
+  color: var(--ink);
+}
+
+.result-open:focus-visible {
+  outline: 2px solid var(--ink-faint);
+  outline-offset: 2px;
+}
+
 @media (max-width: 560px) {
   .result-score {
     display: none;
@@ -900,6 +926,14 @@ textarea:disabled {
   font-family: var(--mono);
   font-variant-numeric: tabular-nums;
   color: var(--ink);
+}
+
+.scale-row .grade-name {
+  display: block;
+  margin-top: 0.1rem;
+  color: var(--ink-faint);
+  font-size: 0.7rem;
+  line-height: 1.2;
 }
 
 @media (max-width: 520px) {

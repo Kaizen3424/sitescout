@@ -1,41 +1,90 @@
 """Scoring: turn the model's answers plus the HTML signals into a verdict,
-talking points and a draft opening line."""
+talking points and a draft opening line.
+
+The design judgement is three graded choices (visual / navigation /
+credibility) and a fixed 60/20/20 formula. The model picks the grade; Python
+does the arithmetic, so two sites with the same grades always get the same
+score.
+"""
 from __future__ import annotations
 
 import statistics
 
-SCORE_KEYS = ["visual_modernity", "layout_hierarchy", "typography_readability",
-              "imagery_quality", "conversion_clarity", "trust_professionalism"]
-SCORE_WEIGHTS = {"visual_modernity": 0.30, "layout_hierarchy": 0.20, "typography_readability": 0.15,
-                 "imagery_quality": 0.15, "conversion_clarity": 0.10, "trust_professionalism": 0.10}
-SCORE_LABELS = {"visual_modernity": "Visual modernity", "layout_hierarchy": "Layout & hierarchy",
-                "typography_readability": "Typography", "imagery_quality": "Imagery",
-                "conversion_clarity": "Offer & call-to-action", "trust_professionalism": "Professional / trust"}
-DIM_ISSUES = {
-    "visual_modernity": ("the overall design looks dated", "the design looks a few years behind current standards"),
-    "layout_hierarchy": ("the layout is cluttered or hard to scan", "the layout is hard to scan, so visitors may not find what they need"),
-    "typography_readability": ("text styling hurts readability", "the text styling makes the content harder to read than it should be"),
-    "imagery_quality": ("images are low quality or poorly used", "the imagery looks low-quality, which weakens first impressions"),
-    "conversion_clarity": ("the offer / next step is unclear", "it isn't immediately clear what to do next (call, book, order)"),
-    "trust_professionalism": ("the site doesn't project a professional image", "the site may not be projecting the professional image the business deserves"),
+GRADE_KEYS = ["visual", "navigation", "credibility"]
+GRADE_WEIGHTS = {"visual": 0.60, "navigation": 0.20, "credibility": 0.20}
+GRADE_LABELS = {"visual": "Visual appeal", "navigation": "Navigation",
+                "credibility": "Professional look"}
+
+# How far each grade is from a current best-practice website:
+# 0.0 = already there, 1.0 = completely off.
+GRADE_GAPS = {
+    "visual": {"premium": 0.0, "contemporary": 0.2, "dated_tidy": 0.5, "dated": 0.8, "poor": 1.0},
+    "navigation": {"effortless": 0.0, "clear": 0.2, "workable": 0.5, "confusing": 0.8, "lost": 1.0},
+    "credibility": {"excellent": 0.0, "good": 0.2, "ordinary": 0.5, "weak": 0.8, "amateur": 1.0},
 }
+GRADE_NAMES = {
+    "visual": {"premium": "Premium", "contemporary": "Contemporary template",
+               "dated_tidy": "Tidy but dated", "dated": "Clearly dated", "poor": "Poor / off-putting"},
+    "navigation": {"effortless": "Effortless", "clear": "Clear", "workable": "Workable",
+                   "confusing": "Confusing", "lost": "Lost"},
+    "credibility": {"excellent": "Excellent", "good": "Good", "ordinary": "Ordinary",
+                    "weak": "Weak", "amateur": "Amateur"},
+}
+GRADE_ISSUES = {
+    "visual": ("the design looks dated or unappealing at first glance",
+               "the site doesn't look as good as the business deserves"),
+    "navigation": ("visitors have to hunt for key information",
+                   "it isn't obvious where to find the properties, services or contact details"),
+    "credibility": ("the site doesn't project a professional image",
+                    "the site may not be projecting the professional image the business deserves"),
+}
+
+# Kept as aliases so reporting and the future API port share one vocabulary.
+SCORE_KEYS = GRADE_KEYS
+SCORE_LABELS = GRADE_LABELS
+
+SIGNAL_SHARE = 0.10  # technical HTML flags are a small bonus, not a reweighting
+
+
+def choice_key(grade: str) -> str:
+    """The Decisions API question key for a grade ('visual' -> 'visual_grade')."""
+    return f"{grade}_grade"
+
+
+def expected_gap(answer: dict, gaps: dict[str, float]) -> float:
+    """Probability-weighted distance from a current best-practice website."""
+    probs = {k: float(v) for k, v in (answer.get("probabilities") or {}).items()}
+    mass = sum(probs.values())
+    if mass > 0:
+        total = sum(probs.get(level, 0.0) * gaps.get(level, 0.0) for level in probs)
+        total /= mass
+    else:
+        total = gaps.get(str(answer.get("choice")), 0.5)
+    return min(1.0, max(0.0, total))
+
+
+def score_from_grades(choices: dict) -> dict:
+    """Pure function: the three grade answers -> gaps, weighted parts, need."""
+    gaps = {k: expected_gap(choices[choice_key(k)], GRADE_GAPS[k]) for k in GRADE_KEYS}
+    parts = {k: GRADE_WEIGHTS[k] * gaps[k] for k in GRADE_KEYS}
+    return {"gaps": gaps, "parts": parts, "need_model": sum(parts.values())}
 
 
 def evaluate(cfg, m: dict, signals: dict) -> dict:
-    scores, yn, ch = m["scores"], m["yesno"], m["choices"]
-    quality = sum(SCORE_WEIGHTS[k] * scores[k]["norm"] for k in SCORE_KEYS) / sum(SCORE_WEIGHTS.values())
-    p_out, p_unp = yn["looks_outdated"]["p"], yn["looks_unprofessional"]["p"]
-    era = ch["design_era"]["probabilities"]
-    p_old_era = era.get("before_2012", 0.0) + era.get("2012_2017", 0.0)
-    # "Looks unprofessional" is the strongest human signal, so it carries a bit
-    # more weight than the era guess.
-    need_model = 0.50 * (1 - quality) + 0.20 * p_out + 0.20 * p_unp + 0.10 * p_old_era
+    yn, ch = m["yesno"], m["choices"]
+    scored = score_from_grades(ch)
+    gaps, parts, need_model = scored["gaps"], scored["parts"], scored["need_model"]
+
     flags = signals.get("flags", [])
     need_signals = min(1.0, sum(f["weight"] for f in flags))
-    need = 0.8 * need_model + 0.2 * need_signals if signals.get("available") else need_model
-    # Confidence of the verdict comes from the DECISIVE questions (yes/no +
-    # choices), which the focused calls answer with high confidence. The graded
-    # scores are naturally softer and are therefore not part of this number.
+    # Technical flags add a small amount; a site with no flags is not penalised
+    # for the missing signal (the old 80/20 blend silently shrank every score).
+    need = min(1.0, need_model + (SIGNAL_SHARE * need_signals if signals.get("available") else 0.0))
+    design_quality = 1 - need_model
+
+    # Confidence of the verdict comes from the DECISIVE gate questions. The
+    # design grade gets its own confidence: a confident "small business" answer
+    # says nothing about how sure the model is of its visual judgement.
     conf_items = [yn["looks_outdated"]["confidence"],
                   yn["looks_unprofessional"]["confidence"],
                   yn["page_is_broken_or_blank"]["confidence"],
@@ -45,9 +94,13 @@ def evaluate(cfg, m: dict, signals: dict) -> dict:
                   ch["design_era"]["confidence"],
                   ch["business_category"]["confidence"]]
     confidence = statistics.median(conf_items)
+    design_confidence = sum(GRADE_WEIGHTS[k] * ch[choice_key(k)]["confidence"] for k in GRADE_KEYS)
 
     p_broken, p_place = yn["page_is_broken_or_blank"]["p"], yn["is_placeholder_page"]["p"]
     p_local, p_overlay = yn["is_small_local_business"]["p"], yn["obscured_by_overlay"]["p"]
+    p_out, p_unp = yn["looks_outdated"]["p"], yn["looks_unprofessional"]["p"]
+    era = ch["design_era"]["probabilities"]
+    p_old_era = era.get("before_2012", 0.0) + era.get("2012_2017", 0.0)
     reasons: list[str] = []
     warnings: list[str] = []
 
@@ -94,23 +147,36 @@ def evaluate(cfg, m: dict, signals: dict) -> dict:
         warnings.append("A popup/overlay seems to cover part of the page; scores may be less reliable.")
     if p_place > 0.70 and verdict != "UNSCORED":
         warnings.append("Page looks like a placeholder / under-construction page.")
+    if design_confidence < 0.50 and verdict != "UNSCORED":
+        warnings.append(f"The design grade is uncertain (weighted confidence {design_confidence:.2f}); "
+                        "look at the saved screenshot before acting on it.")
     if signals.get("available") and not signals["contact"].get("best"):
         warnings.append("No contact route found on the homepage: check the contact page, Google Business Profile "
                         "or social profiles.")
     if not signals.get("available"):
         warnings.append(signals.get("note", "HTML signals unavailable"))
 
-    # talking points: weakest design dimensions + technical flags, strongest first
+    # talking points: weakest design grades + technical flags, strongest first
     issues = []
-    for k in SCORE_KEYS:
-        norm = scores[k]["norm"]
-        if norm < 0.40:
-            issues.append({"label": DIM_ISSUES[k][0], "phrase": DIM_ISSUES[k][1], "severity": round(1 - norm, 2)})
+    for k in GRADE_KEYS:
+        gap = gaps[k]
+        if gap >= 0.40:
+            issues.append({"label": GRADE_ISSUES[k][0], "phrase": GRADE_ISSUES[k][1], "severity": round(gap, 2)})
     scale = {"no_https": 0.85, "no_viewport": 0.90, "legacy_tech": 0.70, "table_layout": 0.65,
              "legacy_generator": 0.55, "stale_copyright": 0.50, "old_libs": 0.45, "legacy_doctype": 0.30}
     for f in flags:
         issues.append({"label": f["label"], "phrase": f["phrase"], "severity": scale.get(f["id"], 0.4)})
     issues.sort(key=lambda i: i["severity"], reverse=True)
+
+    scores = {}
+    for k in GRADE_KEYS:
+        grade = ch[choice_key(k)]
+        choice = grade["choice"]
+        scores[k] = {"score_0_to_10": round((1 - gaps[k]) * 10, 1),
+                     "confidence": round(grade["confidence"], 3),
+                     "grade": choice, "label": GRADE_NAMES[k].get(choice, choice),
+                     "probabilities": {level: round(float(p), 3)
+                                       for level, p in (grade.get("probabilities") or {}).items()}}
 
     cat = ch["business_category"]
     return {
@@ -118,8 +184,15 @@ def evaluate(cfg, m: dict, signals: dict) -> dict:
         "need_score": round(need, 3),
         "need_model": round(need_model, 3),
         "need_signals": round(need_signals, 3),
-        "design_quality": round(quality, 3),
+        "need_parts": {
+            "visual": round(parts["visual"], 3),
+            "navigation": round(parts["navigation"], 3),
+            "credibility": round(parts["credibility"], 3),
+            "signals": round(SIGNAL_SHARE * need_signals, 3) if signals.get("available") else 0.0,
+        },
+        "design_quality": round(design_quality, 3),
         "model_confidence": round(confidence, 3),
+        "design_confidence": round(design_confidence, 3),
         "probabilities": {"outdated": round(p_out, 3), "unprofessional": round(p_unp, 3),
                           "old_era": round(p_old_era, 3), "small_local_business": round(p_local, 3),
                           "placeholder": round(p_place, 3), "overlay": round(p_overlay, 3),
@@ -129,6 +202,7 @@ def evaluate(cfg, m: dict, signals: dict) -> dict:
         "issues": issues,
         "category": {"name": cat["choice"], "confidence": round(cat["confidence"], 3)},
         "design_era": {"name": ch["design_era"]["choice"], "confidence": round(ch["design_era"]["confidence"], 3)},
+        "scores": scores,
     }
 
 
