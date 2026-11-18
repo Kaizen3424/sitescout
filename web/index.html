@@ -32,6 +32,10 @@
           </svg>
           <span>SiteScout</span>
         </a>
+        <nav class="masthead-nav" aria-label="Main">
+          <a href="/" data-home data-nav="home">Batches</a>
+          <a href="/lists" data-lists data-nav="lists">Lists</a>
+        </nav>
         <p class="masthead-note">Find local websites worth pitching a redesign to.</p>
       </div>
     </header>
@@ -106,6 +110,9 @@
             </div>
             <div class="job-head-actions">
               <button class="btn btn-ghost" id="copy-link" type="button">Copy link</button>
+              <button class="btn btn-ghost" id="job-add-list" type="button" hidden>
+                Add to list
+              </button>
               <button class="btn btn-ghost" id="new-batch" type="button">New batch</button>
             </div>
           </div>
@@ -154,6 +161,123 @@
           </div>
         </div>
       </section>
+
+      <!-- ---------------------------------------------------------- lists -->
+      <section class="view" id="view-lists" hidden>
+        <div class="panel">
+          <div class="job-head">
+            <div class="job-head-main">
+              <h1 class="job-title">Lists</h1>
+              <p class="lede">
+                A batch is one run: it disappears after 30 days. A list is what you keep — one
+                row per website, with its latest report, the checks before it, and where you are
+                with the outreach.
+              </p>
+            </div>
+            <div class="job-head-actions">
+              <button class="btn btn-ghost" id="lists-unlock" type="button" hidden>Unlock</button>
+              <button class="btn btn-ghost" id="lists-import" type="button" hidden>
+                Import report.json
+              </button>
+              <button class="btn btn-primary" id="lists-new" type="button" hidden>New list</button>
+            </div>
+          </div>
+
+          <p class="access-note" id="lists-access" hidden></p>
+          <p class="form-error" id="lists-error" role="alert" hidden></p>
+
+          <div class="list-cards" id="lists-grid"></div>
+          <div class="empty" id="lists-empty" hidden>
+            No lists yet. Run a batch, then press <strong>Add to list</strong> on it.
+          </div>
+        </div>
+      </section>
+
+      <!-- ------------------------------------------------------- one list -->
+      <section class="view" id="view-list" hidden>
+        <div class="panel">
+          <div class="job-head">
+            <div class="job-head-main">
+              <a class="back-link" href="/lists" data-lists>← All lists</a>
+              <h1 class="job-title" id="list-title">List</h1>
+              <p class="list-description" id="list-description" hidden></p>
+              <p class="job-sub mono" id="list-meta"></p>
+            </div>
+            <div class="job-head-actions">
+              <button class="btn btn-primary" id="list-add-batch" type="button" hidden>
+                Add a batch
+              </button>
+              <button class="btn btn-ghost" id="list-export" type="button" hidden>
+                Export CSV
+              </button>
+              <button class="btn btn-ghost" id="list-backup" type="button" hidden>Backup</button>
+              <button class="btn btn-ghost" id="list-import" type="button" hidden>Import</button>
+              <button class="btn btn-ghost" id="list-manage" type="button" hidden>Manage</button>
+              <button class="btn btn-ghost" id="list-unlock" type="button" hidden>Unlock</button>
+            </div>
+          </div>
+
+          <p class="access-note" id="list-access" hidden></p>
+          <div class="totals" id="list-totals"></div>
+
+          <div class="toolbar" id="list-toolbar" hidden>
+            <input
+              type="search"
+              id="list-search"
+              class="search"
+              placeholder="Filter by address, name, tag or note…"
+              aria-label="Filter sites"
+            />
+            <select id="list-verdict" class="select" aria-label="Filter by verdict">
+              <option value="all">Every verdict</option>
+              <option value="REACH_OUT">Reach out</option>
+              <option value="MAYBE">Maybe</option>
+              <option value="SKIP">Skip</option>
+              <option value="SITE_DOWN">Site down</option>
+              <option value="attention">Needs attention</option>
+            </select>
+            <select id="list-status" class="select" aria-label="Filter by outreach status" hidden>
+              <option value="all">Every status</option>
+              <option value="new">New</option>
+              <option value="contacted">Contacted</option>
+              <option value="follow_up">Follow up</option>
+              <option value="won">Won</option>
+              <option value="no">No</option>
+            </select>
+            <select id="list-sort" class="select" aria-label="Sort sites">
+              <option value="need-desc">Highest need first</option>
+              <option value="need-asc">Lowest need first</option>
+              <option value="visual-asc">Worst design first</option>
+              <option value="checked-desc">Recently checked first</option>
+              <option value="added-desc">Recently added first</option>
+              <option value="name-asc">Address A–Z</option>
+              <option value="status">Outreach status</option>
+            </select>
+            <span class="spacer"></span>
+            <button class="btn btn-ghost" id="list-select" type="button" hidden>Select</button>
+          </div>
+
+          <div class="bulk-bar" id="list-bulk" hidden>
+            <span class="mono strong" id="bulk-count"></span>
+            <button class="link-btn" id="bulk-all" type="button">Select all shown</button>
+            <span class="spacer"></span>
+            <select id="bulk-status" class="select" aria-label="Status for the selected sites">
+              <option value="new">New</option>
+              <option value="contacted">Contacted</option>
+              <option value="follow_up">Follow up</option>
+              <option value="won">Won</option>
+              <option value="no">No</option>
+            </select>
+            <button class="btn btn-ghost" id="bulk-apply" type="button">Set status</button>
+            <button class="btn btn-ghost" id="bulk-remove" type="button">Remove</button>
+            <button class="btn btn-ghost" id="bulk-cancel" type="button">Done</button>
+          </div>
+
+          <p class="form-error" id="list-error" role="alert" hidden></p>
+          <div class="sites" id="list-sites"></div>
+          <div class="empty" id="list-empty" hidden></div>
+        </div>
+      </section>
     </main>
 
     <footer class="wrap site-foot">
@@ -163,6 +287,17 @@
       </p>
       <p class="foot-links"><a href="/v1">API</a> <span aria-hidden="true">·</span> <a href="/health">Status</a></p>
     </footer>
+
+    <dialog class="modal" id="modal" aria-labelledby="modal-title">
+      <div class="modal-inner">
+        <div class="modal-head">
+          <h2 id="modal-title">…</h2>
+          <button class="modal-close" id="modal-close" type="button" aria-label="Close">×</button>
+        </div>
+        <div class="modal-body" id="modal-body"></div>
+        <div class="modal-actions" id="modal-actions"></div>
+      </div>
+    </dialog>
 
     <noscript>
       <p class="wrap noscript">This page needs JavaScript to submit and follow a batch.</p>

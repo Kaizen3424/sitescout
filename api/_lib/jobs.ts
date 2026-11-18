@@ -334,31 +334,46 @@ export async function readWaiting(id: string): Promise<Record<string, number>> {
   return out;
 }
 
+export interface JobEntry {
+  index: number;
+  report: Report;
+}
+
+/**
+ * The stored reports together with the position they were queued at.
+ *
+ * `readJob()` only needs the reports, but a permanent list must know which
+ * batch index a report came from to keep imports idempotent.
+ */
+export async function readJobEntries(id: string): Promise<JobEntry[]> {
+  const raw = toRecord(await getRedis().hgetall(resultsKey(id)));
+  const entries: JobEntry[] = [];
+  for (const [key, value] of Object.entries(raw)) {
+    const index = Number(key);
+    if (!Number.isInteger(index)) continue;
+    try {
+      entries.push({ index, report: JSON.parse(value) as Report });
+    } catch {
+      // A corrupt field is ignored; the next delivery rewrites it.
+    }
+  }
+  return entries.sort((a, b) => a.index - b.index);
+}
+
 export async function readJob(id: string, config: JobConfig): Promise<JobView | null> {
   const redis = getRedis();
   const meta = await readMeta(id);
   if (!meta) return null;
 
-  const raw = toRecord(await redis.hgetall(resultsKey(id)));
-  const entries = Object.entries(raw)
-    .map(([key, value]) => [Number(key), value] as const)
-    .filter(([index]) => Number.isInteger(index))
-    .sort((a, b) => a[0] - b[0]);
-
-  const results: Report[] = [];
-  for (const [, value] of entries) {
-    try {
-      results.push(JSON.parse(value) as Report);
-    } catch {
-      // A corrupt field is ignored; the next delivery rewrites it.
-    }
-  }
+  const entries = await readJobEntries(id);
+  const results = entries.map((entry) => entry.report);
 
   const done = entries.length;
   const waitingMap = await readWaiting(id);
   // A URL that already has a report cannot be waiting any more.
+  const doneIndexes = new Set(entries.map((entry) => entry.index));
   const waitingIndexes = Object.keys(waitingMap).filter(
-    (index) => !entries.some(([position]) => position === Number(index)),
+    (index) => !doneIndexes.has(Number(index)),
   );
   const dueTimes = waitingIndexes
     .map((index) => waitingMap[index]!)

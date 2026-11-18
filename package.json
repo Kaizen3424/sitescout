@@ -10,7 +10,6 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "tsx --test \"test/**/*.test.ts\"",
-    "dev": "vercel dev",
     "deploy": "vercel --prod"
   },
   "dependencies": {

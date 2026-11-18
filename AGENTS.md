@@ -4,17 +4,24 @@ Judges whether a business website is worth pitching a redesign to. Personal,
 open-source, educational project: **non-commercial**, no ads, no client work.
 That is what allows the API to run on Vercel's free Hobby plan.
 
-## Three parts, one pipeline
+## Four parts, one pipeline
 
 | Part | Where | What |
 |------|-------|------|
 | Python CLI | `cli/` (`sitescout.py`, `cli.py`, ...) | Local batch tool, one line per site, writes one `report.json`. |
 | TypeScript API | `api/` | HTTP wrapper around the same pipeline, deployed on Vercel. |
-| Web interface | `web/` | Static page at `/`: paste 1–50 URLs, close the browser, come back for the reports. |
+| Web interface | `web/` | Static page at `/`: paste 1–50 URLs, close the browser, come back for the reports. Also `/lists`: the permanent lists (see below). |
+| Lists | `api/_lib/lists.ts` | Permanent copies of finished reports: status, notes, tags, history. |
 
 The CLI is the reference implementation. The API must produce the same verdicts
 and the same report field names. The page has no build step and no framework:
 plain HTML, CSS and one ES module.
+
+Lists are the part that outlives a batch: they copy finished reports out of a
+batch into permanent rows, one per domain, with outreach status, notes, tags and
+a short history. Batches keep their 30-day TTL; lists have none. Nothing is added
+automatically — the page calls `importJob` or `importReports` only when the owner
+presses Add. Lists never call Firecrawl, Gemini or QStash.
 
 Workflow: test and iterate in `cli/`; once a change is finalised, port it to
 `api/` and deploy.
@@ -41,6 +48,11 @@ index at `/v1`. Deployed from the `main` branch of
   run per day, which is useless here).
 - **The web form is public**: no login. Abuse protection is the Redis quota
   (batches per IP per hour, URLs per day globally), not a token.
+- **Lists are public by link too.** With no `SITESCOUT_LIST_KEY` the link is the
+  secret and management is open; with a key, writes need `x-sitescout-list-key`
+  and private lists answer 404 without it. Never add a session or user table.
+- **Nothing is added to a list automatically.** `POST /v1/jobs` only registers the
+  batch for the picker; importing is an explicit call.
 - `/v1/analyze` stays token-protected; the batch endpoints do not use the token.
 - `/v1/jobs/run` accepts only genuine QStash callbacks: verify the signature
   against `${origin}/v1/jobs/run`, never against `request.url`.
@@ -86,11 +98,18 @@ curl.exe -s -X POST https://sitescout-dusky.vercel.app/v1/jobs `
   deploying each file as its own function.
 - `api/_lib/jobs.ts` — job store in Upstash Redis, quota counters, QStash
   dispatch and signature checks.
+- `api/_lib/lists.ts` — permanent lists: merge rules, caps, key, rate limits,
+  CSV, backup/restore. Key space is `ss:list:*` and has no TTL.
 - `api/_lib/jobrunner.ts` — analyses exactly one URL per callback.
 - `api/_lib/redis.ts` — REST client; `hgetall` returns a flat array in raw mode.
 - `api/README.md` — endpoint contract, env vars, deploy steps.
 - `web/index.html`, `web/styles.css`, `web/app.js` — the page.
-- `vercel.json` — rewrites (`/` and `/j/:id` → the page) and the 300 s limit.
-  `/v1/jobs/run` must stay before `/v1/jobs/:id`.
+- `test/lists.model.test.ts` — merge rules without Redis.
+- `test/lists.redis.test.ts` — the store against real Redis (unique namespace per
+  test, skipped without credentials).
+- `test/lists.api.test.ts` — the real handler, key handling and the public view.
+- `vercel.json` — rewrites (`/`, `/j/:id`, `/lists`, `/l/:id` → the page) and the
+  300 s limit. `/v1/jobs/run` must stay before `/v1/jobs/:id`, and
+  `/v1/lists/import` + `/v1/lists/reports` before `/v1/lists/:id`.
 - `tsconfig.json`, `package.json` — build config (Vercel only reads these from the
   repo root). `tsconfig.json` covers `api/` only; `web/` is not type-checked.

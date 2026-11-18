@@ -10,6 +10,7 @@ const MAX_URLS = 50;
 const POLL_MS = 4000;
 const RECENT_KEY = "sitescout.recent.v1";
 const RECENT_LIMIT = 12;
+const LIST_KEY_STORAGE = "sitescout.listkey.v1";
 
 const VERDICTS = [
   { key: "REACH_OUT", label: "Reach out", tone: "good" },
@@ -33,6 +34,14 @@ const SCORE_LABELS = {
   credibility: "Professional look",
 };
 
+const SITE_STATUSES = [
+  { key: "new", label: "New", tone: "plain" },
+  { key: "contacted", label: "Contacted", tone: "warn" },
+  { key: "follow_up", label: "Follow up", tone: "warn" },
+  { key: "won", label: "Won", tone: "good" },
+  { key: "no", label: "No", tone: "plain" },
+];
+
 const state = {
   jobId: null,
   job: null,
@@ -45,8 +54,32 @@ const state = {
   failures: 0,
 };
 
+const listState = {
+  lists: [],
+  owner: true,
+  management: "open",
+  list: null,
+  sites: [],
+  batches: [],
+  detail: new Map(),
+  detailErrors: new Map(),
+  pending: new Set(),
+  open: new Set(),
+  query: "",
+  verdict: "all",
+  status: "all",
+  sort: "need-desc",
+  selecting: false,
+  selected: new Set(),
+};
+
 const $ = (id) => document.getElementById(id);
-const views = { home: $("view-home"), job: $("view-job") };
+const views = {
+  home: $("view-home"),
+  job: $("view-job"),
+  lists: $("view-lists"),
+  list: $("view-list"),
+};
 
 /* ------------------------------------------------------------------ utils */
 
@@ -286,6 +319,14 @@ function setView(name) {
   for (const [key, node] of Object.entries(views)) node.hidden = key !== name;
   if (name === "home") document.title = "SiteScout — find sites worth a redesign";
   if (name === "job") window.scrollTo({ top: 0, behavior: "smooth" });
+
+  const nav = name === "lists" || name === "list" ? "lists" : "home";
+  for (const link of document.querySelectorAll("[data-nav]")) {
+    const active = link.dataset.nav === nav;
+    link.classList.toggle("active", active);
+    if (active) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
+  }
 }
 
 function goHome(push = true) {
@@ -329,6 +370,7 @@ function resetJobView() {
   $("job-foot").hidden = true;
   $("job-error").hidden = true;
   $("download").href = "#";
+  $("job-add-list").hidden = true;
   $("search").value = "";
   $("sort").value = "need-desc";
   state.query = "";
@@ -432,6 +474,8 @@ function renderJob(job) {
   renderTotals(job);
 
   $("download").href = `/v1/jobs/${encodeURIComponent(job.id)}/report.json`;
+  // Only a batch with at least one finished report is worth adding.
+  $("job-add-list").hidden = !(Number(job.done) > 0);
 
   renderResults(job);
 
@@ -980,6 +1024,1560 @@ function loadFile(file) {
   reader.readAsText(file);
 }
 
+/* ------------------------------------------------------------------ lists */
+
+function statusMeta(key) {
+  return (
+    SITE_STATUSES.find((entry) => entry.key === key) ?? {
+      key,
+      label: String(key ?? "New"),
+      tone: "plain",
+    }
+  );
+}
+
+function listKey() {
+  try {
+    return localStorage.getItem(LIST_KEY_STORAGE) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function rememberListKey(value) {
+  try {
+    if (value) localStorage.setItem(LIST_KEY_STORAGE, value);
+    else localStorage.removeItem(LIST_KEY_STORAGE);
+  } catch {
+    // Private mode: the key then lasts for this page view only.
+  }
+}
+
+function listHeaders() {
+  const key = listKey();
+  return key ? { "x-sitescout-list-key": key } : {};
+}
+
+/** Every list call goes through here, so the optional key is always attached. */
+async function listApi(path, options = {}) {
+  return api(path, {
+    ...options,
+    headers: { ...listHeaders(), ...(options.headers ?? {}) },
+  });
+}
+
+function showBox(id, message) {
+  const box = $(id);
+  if (!box) return;
+  box.textContent = message ?? "";
+  box.hidden = !message;
+}
+
+function showListPageError(message) {
+  showBox("list-error", message);
+}
+
+function slug(value) {
+  return (
+    String(value ?? "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-|-$/g, "") || "list"
+  );
+}
+
+function downloadBlob(name, blob) {
+  const url = URL.createObjectURL(blob);
+  const link = el("a", { href: url, download: name });
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+function downloadText(name, text, type = "application/json") {
+  downloadBlob(name, new Blob([text], { type: `${type};charset=utf-8` }));
+}
+
+/* -------------------------------------------------------------- dialogues */
+
+function openModal({ title, body = [], actions = [] }) {
+  const dialog = $("modal");
+  // A dialog can only be opened once; confirmations replace the previous one.
+  if (dialog.open) dialog.close();
+
+  $("modal-title").textContent = title;
+  const bodyHost = $("modal-body");
+  clear(bodyHost);
+  for (const node of [].concat(body).flat(Infinity)) {
+    if (node === null || node === undefined || node === false) continue;
+    bodyHost.append(node instanceof Node ? node : document.createTextNode(String(node)));
+  }
+
+  const actionHost = $("modal-actions");
+  clear(actionHost);
+  for (const action of actions) {
+    const kind = action.kind === "primary" ? "btn-primary" : action.kind === "danger" ? "btn-danger" : "btn-ghost";
+    const button = el("button", {
+      class: `btn ${kind}`,
+      type: "button",
+      text: action.label,
+      disabled: action.disabled === true,
+    });
+    button.addEventListener("click", async () => {
+      if (!action.onClick) {
+        closeModal();
+        return;
+      }
+      const label = button.textContent;
+      button.disabled = true;
+      try {
+        const keepOpen = await action.onClick();
+        if (keepOpen !== false) closeModal();
+      } catch (err) {
+        modalError(err instanceof Error ? err.message : String(err));
+      } finally {
+        button.disabled = false;
+        button.textContent = label;
+      }
+    });
+    actionHost.append(button);
+  }
+  actionHost.hidden = actions.length === 0;
+  dialog.showModal();
+}
+
+function closeModal() {
+  const dialog = $("modal");
+  if (dialog.open) dialog.close();
+}
+
+function modalError(message) {
+  const body = $("modal-body");
+  let box = body.querySelector(".modal-error");
+  if (!box) {
+    box = el("p", { class: "form-error modal-error", role: "alert" });
+    body.prepend(box);
+  }
+  box.textContent = message;
+  box.hidden = false;
+}
+
+function modalResults(title, rows, note = null) {
+  $("modal-title").textContent = title;
+  const body = $("modal-body");
+  clear(body);
+  if (note) body.append(el("p", { class: "hint", text: note }));
+  body.append(
+    el(
+      "ul",
+      { class: "import-results" },
+      rows.map((row) =>
+        el("li", { class: row.ok ? "" : "bad" }, [
+          el("strong", { text: row.name }),
+          el("span", { text: row.text }),
+        ]),
+      ),
+    ),
+  );
+  const actions = $("modal-actions");
+  clear(actions);
+  actions.hidden = false;
+  actions.append(
+    el("button", {
+      class: "btn btn-primary",
+      type: "button",
+      text: "Done",
+      onclick: closeModal,
+    }),
+  );
+}
+
+function field(labelText, control) {
+  return el("label", { class: "field-inline" }, [
+    el("span", { class: "field-label", text: labelText }),
+    control,
+  ]);
+}
+
+function textInput(props = {}) {
+  return el("input", { type: "text", class: "input", ...props });
+}
+
+function choiceRow(list, checked = false, suffix = "") {
+  const box = el("input", { type: "checkbox", value: list.id });
+  box.checked = checked;
+  return el("label", { class: "check list-choice" }, [
+    box,
+    el("span", { text: list.name }),
+    el("span", { class: "hint", text: suffix ? ` · ${suffix}` : "" }),
+  ]);
+}
+
+function choicesFrom(host) {
+  return [...host.querySelectorAll('input[type="checkbox"]')]
+    .filter((box) => box.checked)
+    .map((box) => box.value);
+}
+
+function listName(id) {
+  return listState.lists.find((list) => list.id === id)?.name ?? id.slice(0, 8);
+}
+
+function accessMessage() {
+  if (listState.owner) return "";
+  if (listState.management === "key") {
+    return "Public view: notes, outreach status and contact routes are hidden. Press Unlock to change anything.";
+  }
+  if (listState.management === "disabled") {
+    return "List management is switched off on this deployment, so lists are read-only.";
+  }
+  return "";
+}
+
+/* ------------------------------------------------------------ unlock flow */
+
+function openKeyModal() {
+  const input = el("input", {
+    type: "password",
+    class: "input",
+    autocomplete: "current-password",
+    placeholder: "SITESCOUT_LIST_KEY",
+  });
+  openModal({
+    title: "Management key",
+    body: [
+      el("p", {
+        class: "hint",
+        text: "This SiteScout protects changes with a management key. Paste it once; this browser remembers it.",
+      }),
+      field("Key", input),
+    ],
+    actions: [
+      {
+        label: "Unlock",
+        kind: "primary",
+        onClick: async () => {
+          const value = input.value.trim();
+          if (!value) {
+            modalError("Paste the management key.");
+            return false;
+          }
+          rememberListKey(value);
+          const result = await listApi("/v1/lists");
+          if (!result.ok) {
+            rememberListKey("");
+            modalError(apiErrorMessage(result, "That key was not accepted."));
+            return false;
+          }
+          listState.owner = Boolean(result.data?.owner);
+          listState.management = result.data?.management ?? "key";
+          if (document.body.dataset.view === "lists") await loadLists();
+          else if (document.body.dataset.view === "list" && listState.list) {
+            await loadList(listState.list.id);
+          }
+          return true;
+        },
+      },
+    ],
+  });
+  input.focus();
+}
+
+/* -------------------------------------------------------------- dashboard */
+
+async function openLists({ push = false } = {}) {
+  stopPolling();
+  state.jobId = null;
+  state.job = null;
+  listState.list = null;
+  listState.sites = [];
+  listState.batches = [];
+  listState.detail.clear();
+  listState.detailErrors.clear();
+  listState.open.clear();
+  listState.selected.clear();
+  listState.selecting = false;
+  setView("lists");
+  if (push) history.pushState({ view: "lists" }, "", "/lists");
+  document.title = "Lists — SiteScout";
+  await loadLists();
+}
+
+async function loadLists() {
+  showBox("lists-error", "");
+  const result = await listApi("/v1/lists");
+  if (!result.ok) {
+    listState.lists = [];
+    if (result.status === 401) {
+      listState.owner = false;
+      listState.management = "key";
+      renderLists();
+      showBox("lists-error", "That management key was not accepted. Press Unlock to enter it again.");
+      return;
+    }
+    renderLists();
+    showBox("lists-error", apiErrorMessage(result, "Could not load the lists."));
+    return;
+  }
+  listState.lists = Array.isArray(result.data?.lists) ? result.data.lists : [];
+  listState.owner = Boolean(result.data?.owner);
+  listState.management = result.data?.management ?? "open";
+  renderLists();
+}
+
+function renderLists() {
+  const owner = listState.owner;
+  $("lists-new").hidden = !owner;
+  $("lists-import").hidden = !owner;
+  $("lists-unlock").hidden = owner || listState.management !== "key";
+
+  const note = $("lists-access");
+  note.textContent = accessMessage();
+  note.hidden = !note.textContent;
+
+  const grid = $("lists-grid");
+  clear(grid);
+  for (const list of listState.lists) {
+    const bits = [`${list.siteCount} ${list.siteCount === 1 ? "site" : "sites"}`];
+    if (list.updatedAt) bits.push(`updated ${shortDate(list.updatedAt)}`);
+    if (list.visibility !== "public") bits.push(list.visibility);
+
+    const card = el(
+      "a",
+      {
+        class: "list-card",
+        href: `/l/${list.id}`,
+        onclick: (event) => {
+          event.preventDefault();
+          openList(list.id, { push: true });
+        },
+      },
+      [
+        el("div", { class: "list-card-head" }, [
+          el("h2", { text: list.name }),
+          el("span", { class: "count mono", text: String(list.siteCount) }),
+        ]),
+        list.description ? el("p", { class: "list-card-desc", text: list.description }) : null,
+        el("p", { class: "list-card-meta mono", text: bits.join(" · ") }),
+      ],
+    );
+    grid.append(card);
+  }
+
+  $("lists-empty").hidden = listState.lists.length > 0;
+}
+
+/* ---------------------------------------------------------------- one list */
+
+async function openList(id, { push = false } = {}) {
+  stopPolling();
+  state.jobId = null;
+  state.job = null;
+  listState.list = null;
+  listState.sites = [];
+  listState.batches = [];
+  listState.detail.clear();
+  listState.detailErrors.clear();
+  listState.open.clear();
+  listState.selected.clear();
+  listState.selecting = false;
+  listState.query = "";
+  listState.verdict = "all";
+  listState.status = "all";
+  listState.sort = "need-desc";
+  resetListView();
+  setView("list");
+  if (push) history.pushState({ view: "list", id }, "", `/l/${encodeURIComponent(id)}`);
+  await loadList(id);
+}
+
+function resetListView() {
+  // Nothing from the previous list may linger while the next one loads.
+  $("list-title").textContent = "Loading…";
+  for (const id of ["list-add-batch", "list-export", "list-backup", "list-import", "list-manage", "list-select", "list-unlock"]) {
+    $(id).hidden = true;
+  }
+  $("list-description").hidden = true;
+  $("list-description").textContent = "";
+  $("list-meta").textContent = "";
+  clear($("list-totals"));
+  clear($("list-sites"));
+  $("list-toolbar").hidden = true;
+  $("list-bulk").hidden = true;
+  $("list-empty").hidden = true;
+  showListPageError("");
+  $("list-search").value = "";
+  $("list-verdict").value = "all";
+  $("list-status").value = "all";
+  $("list-sort").value = "need-desc";
+}
+
+async function loadList(id) {
+  showListPageError("");
+  const result = await listApi(`/v1/lists/${encodeURIComponent(id)}`);
+  if (!result.ok) {
+    $("list-title").textContent = "List not found";
+    $("list-meta").textContent = "";
+    showListPageError(apiErrorMessage(result, "This list does not exist (it may have been deleted)."));
+    for (const button of ["list-add-batch", "list-export", "list-backup", "list-import", "list-manage", "list-unlock"]) {
+      $(button).hidden = true;
+    }
+    return;
+  }
+
+  listState.list = result.data.list;
+  listState.sites = Array.isArray(result.data.sites) ? result.data.sites : [];
+  listState.batches = Array.isArray(result.data.batches) ? result.data.batches : [];
+  listState.owner = Boolean(result.data.owner);
+  listState.management = result.data.management ?? "open";
+  // The cached details belong to the previous copy of the list; an import or a
+  // bulk change may have replaced them.
+  listState.detail.clear();
+  listState.detailErrors.clear();
+  for (const key of listState.open) {
+    if (!listState.sites.some((site) => site.key === key)) listState.open.delete(key);
+  }
+  renderList();
+}
+
+function renderList() {
+  const list = listState.list;
+  if (!list) return;
+  const owner = listState.owner;
+
+  $("list-title").textContent = list.name;
+  const description = $("list-description");
+  description.textContent = list.description ?? "";
+  description.hidden = !description.textContent;
+
+  const bits = [`${list.siteCount} ${list.siteCount === 1 ? "site" : "sites"}`];
+  if (list.createdAt) bits.push(`started ${shortDate(list.createdAt)}`);
+  if (list.updatedAt) bits.push(`updated ${shortDate(list.updatedAt)}`);
+  if (list.visibility !== "public") bits.push(list.visibility);
+  $("list-meta").textContent = bits.join(" · ");
+
+  for (const id of ["list-add-batch", "list-export", "list-backup", "list-import", "list-manage", "list-select"]) {
+    $(id).hidden = !owner;
+  }
+  $("list-unlock").hidden = owner || listState.management !== "key";
+  $("list-status").hidden = !owner;
+
+  const note = $("list-access");
+  note.textContent = accessMessage();
+  note.hidden = !note.textContent;
+
+  document.title = `${list.name} — SiteScout`;
+  renderListTotals();
+  renderListSites();
+}
+
+function renderListTotals() {
+  const host = $("list-totals");
+  clear(host);
+  const verdicts = {};
+  let attention = 0;
+  for (const site of listState.sites) {
+    verdicts[site.verdict] = (verdicts[site.verdict] ?? 0) + 1;
+    if (site.attention) attention += 1;
+  }
+  for (const verdict of VERDICTS) {
+    const count = verdicts[verdict.key] ?? 0;
+    if (count === 0) continue;
+    host.append(
+      el("span", { class: "tally", "data-verdict": verdict.key }, [
+        el("b", { text: String(count) }),
+        verdict.label,
+      ]),
+    );
+  }
+  if (attention > 0) {
+    host.append(
+      el("span", { class: "tally", "data-verdict": "attention" }, [
+        el("b", { text: String(attention) }),
+        "need a re-check",
+      ]),
+    );
+  }
+  if (listState.owner) {
+    const statuses = {};
+    for (const site of listState.sites) {
+      const key = site.status ?? "new";
+      statuses[key] = (statuses[key] ?? 0) + 1;
+    }
+    for (const status of SITE_STATUSES) {
+      const count = statuses[status.key] ?? 0;
+      if (count === 0) continue;
+      host.append(
+        el("span", { class: "tally status-tally", "data-tone": status.tone }, [
+          el("b", { text: String(count) }),
+          status.label.toLowerCase(),
+        ]),
+      );
+    }
+  }
+}
+
+function siteHaystack(site) {
+  return [
+    site.host,
+    site.url,
+    site.inputUrl,
+    site.name,
+    site.title,
+    site.category,
+    site.era,
+    site.platform,
+    site.email,
+    site.phone,
+    site.notes,
+    ...(site.tags ?? []),
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+}
+
+function visibleSites() {
+  const query = listState.query.trim().toLowerCase();
+  const sites = listState.sites.filter((site) => {
+    if (listState.verdict === "attention" && !site.attention) return false;
+    if (
+      listState.verdict !== "all" &&
+      listState.verdict !== "attention" &&
+      site.verdict !== listState.verdict
+    ) {
+      return false;
+    }
+    if (listState.status !== "all" && (site.status ?? "new") !== listState.status) return false;
+    if (query && !siteHaystack(site).includes(query)) return false;
+    return true;
+  });
+
+  const need = (site) => (typeof site.need === "number" ? site.need : -1);
+  const visual = (site) => (typeof site.visual === "number" ? site.visual : 99);
+  const checked = (site) => Date.parse(site.profileAt ?? site.lastAttemptAt ?? "") || 0;
+  const added = (site) => Date.parse(site.firstAddedAt ?? "") || 0;
+  const statusRank = (site) =>
+    SITE_STATUSES.findIndex((entry) => entry.key === (site.status ?? "new"));
+
+  switch (listState.sort) {
+    case "need-asc":
+      sites.sort((a, b) => need(a) - need(b) || a.host.localeCompare(b.host));
+      break;
+    case "visual-asc":
+      sites.sort((a, b) => visual(a) - visual(b) || need(b) - need(a));
+      break;
+    case "checked-desc":
+      sites.sort((a, b) => checked(b) - checked(a));
+      break;
+    case "added-desc":
+      sites.sort((a, b) => added(b) - added(a));
+      break;
+    case "name-asc":
+      sites.sort((a, b) => a.host.localeCompare(b.host, undefined, { numeric: true }));
+      break;
+    case "status":
+      sites.sort((a, b) => statusRank(a) - statusRank(b) || need(b) - need(a));
+      break;
+    default:
+      sites.sort((a, b) => need(b) - need(a) || visual(a) - visual(b));
+  }
+  return sites;
+}
+
+function scoreLine(site) {
+  const bits = [typeof site.need === "number" ? `need ${num(site.need)}` : "not scored"];
+  if (typeof site.visual === "number") bits.push(`visual ${num(site.visual, 1)}/10`);
+  if (typeof site.needDelta === "number" && site.needDelta !== 0) {
+    bits.push(`${site.needDelta > 0 ? "▲" : "▼"} ${num(Math.abs(site.needDelta))}`);
+  }
+  return bits.join(" · ");
+}
+
+function renderListSites() {
+  const host = $("list-sites");
+  clear(host);
+  const visible = visibleSites();
+  for (const site of visible) host.append(siteNode(site));
+
+  $("list-toolbar").hidden = listState.sites.length === 0;
+
+  const empty = $("list-empty");
+  if (listState.sites.length === 0) {
+    empty.textContent = listState.owner
+      ? "This list is empty. Open a finished batch and press “Add to list”, or import a report.json."
+      : "This list is empty.";
+    empty.hidden = false;
+  } else if (visible.length === 0) {
+    empty.textContent = "No sites match these filters.";
+    empty.hidden = false;
+  } else {
+    empty.hidden = true;
+  }
+  renderBulk();
+}
+
+function siteNode(site) {
+  const verdict = verdictMeta(site.verdict);
+  const status = statusMeta(site.status);
+  const href = siteHref(site.url);
+  const checkedAt = site.profileAt ?? site.lastAttemptAt ?? "";
+
+  const details = el("details", { class: "site", dataset: { site: site.key } });
+  details.open = listState.open.has(site.key);
+
+  let picker = null;
+  if (listState.selecting && listState.owner) {
+    const box = el("input", { type: "checkbox", "aria-label": `Select ${site.host}` });
+    box.checked = listState.selected.has(site.key);
+    box.addEventListener("change", () => togglePicked(site.key, box.checked));
+    picker = el("span", { class: "pick", onclick: (event) => event.stopPropagation() }, box);
+  }
+
+  const openLink = href
+    ? el("a", {
+        class: "result-open",
+        href,
+        target: "_blank",
+        rel: "noopener noreferrer",
+        title: "Open website in a new tab",
+        text: "Open ↗",
+        onclick: (event) => event.stopPropagation(),
+      })
+    : null;
+
+  const summary = el("summary", {}, [
+    picker,
+    el("span", { class: "verdict-tag", "data-tone": verdict.tone, text: verdict.label }),
+    el("span", { class: "site-main" }, [
+      el("span", { class: "site-host", text: site.host }),
+      site.name || site.title
+        ? el("span", { class: "site-name", text: site.name || site.title })
+        : null,
+      site.attention
+        ? el("span", {
+            class: "flag",
+            title: "The latest check failed, so these scores come from the run before it.",
+            text: "re-check failed",
+          })
+        : null,
+    ]),
+    el("span", {
+      class: "site-score",
+      title: `${site.runs ?? 0} ${site.runs === 1 ? "check" : "checks"} recorded`,
+      text: scoreLine(site),
+    }),
+    listState.owner
+      ? el("span", { class: "status-tag", "data-tone": status.tone, text: status.label })
+      : null,
+    el("span", {
+      class: "site-when mono",
+      text: checkedAt ? `checked ${shortDate(checkedAt)}` : "never checked",
+    }),
+    openLink,
+  ]);
+
+  details.append(summary, siteBody(site));
+  details.addEventListener("toggle", () => {
+    if (details.open) {
+      listState.open.add(site.key);
+      ensureDetail(site);
+    } else {
+      listState.open.delete(site.key);
+    }
+  });
+  // Re-rendered rows that were already open do not always fire `toggle`, so
+  // ask for their report here as well.
+  if (details.open) ensureDetail(site);
+  return details;
+}
+
+async function ensureDetail(site) {
+  const list = listState.list;
+  if (!list) return;
+  if (listState.detail.has(site.key) || listState.pending.has(site.key)) return;
+  const listId = list.id;
+  listState.pending.add(site.key);
+  const result = await listApi(
+    `/v1/lists/${encodeURIComponent(listId)}/sites/${encodeURIComponent(site.key)}`,
+  );
+  listState.pending.delete(site.key);
+  if (listState.list?.id !== listId) return;
+  if (!result.ok) {
+    listState.detailErrors.set(site.key, apiErrorMessage(result, "Could not load this site."));
+  } else {
+    listState.detailErrors.delete(site.key);
+    listState.detail.set(site.key, result.data.site);
+  }
+  renderListSites();
+}
+
+function siteBody(site) {
+  const error = listState.detailErrors.get(site.key);
+  const detail = listState.detail.get(site.key);
+  if (!detail) {
+    return el("div", { class: "result-body" }, [
+      el("p", { class: "result-note", text: error ?? "Loading the last report…" }),
+    ]);
+  }
+
+  const parts = [];
+  if (listState.owner) parts.push(siteEditor(detail.summary));
+  parts.push(historyBlock(detail.history, detail.summary.runs));
+  if (detail.report) parts.push(...resultSections(detail.report));
+  else {
+    parts.push(
+      el("p", {
+        class: "result-note",
+        text: "No full report was kept for this site. The summary above is all there is.",
+      }),
+    );
+  }
+  return el("div", { class: "result-body" }, parts);
+}
+
+function siteEditor(site) {
+  const status = el("select", { class: "select", "aria-label": "Outreach status" });
+  for (const entry of SITE_STATUSES) {
+    const option = el("option", { value: entry.key, text: entry.label });
+    if (entry.key === (site.status ?? "new")) option.selected = true;
+    status.append(option);
+  }
+
+  const tags = textInput({
+    value: (site.tags ?? []).join(", "),
+    placeholder: "bakery, amsterdam",
+    "aria-label": "Tags, comma separated",
+  });
+
+  const notes = el("textarea", {
+    class: "notes",
+    rows: "3",
+    maxlength: "2000",
+    placeholder: "What did you send, and what came back?",
+    text: site.notes ?? "",
+  });
+
+  const note = el("span", { class: "hint save-note", "aria-live": "polite" });
+  const save = el("button", { class: "btn btn-ghost", type: "button", text: "Save" });
+  save.addEventListener("click", () => saveSite(site, { status, notes, tags, save, note }));
+
+  return el("div", { class: "site-editor" }, [
+    el("div", { class: "editor-row" }, [
+      el("label", { class: "editor-field" }, [el("span", { text: "Status" }), status]),
+      el("label", { class: "editor-field wide" }, [el("span", { text: "Tags" }), tags]),
+    ]),
+    el("label", { class: "editor-field" }, [el("span", { text: "Notes" }), notes]),
+    el("div", { class: "editor-foot" }, [note, save]),
+  ]);
+}
+
+async function saveSite(site, controls) {
+  const list = listState.list;
+  if (!list) return;
+  controls.save.disabled = true;
+  controls.note.textContent = "Saving…";
+  controls.note.classList.remove("bad");
+
+  const body = {
+    status: controls.status.value,
+    notes: controls.notes.value,
+    tags: controls.tags.value
+      .split(",")
+      .map((tag) => tag.trim())
+      .filter(Boolean),
+  };
+
+  const result = await listApi(
+    `/v1/lists/${encodeURIComponent(list.id)}/sites/${encodeURIComponent(site.key)}`,
+    { method: "PATCH", body: JSON.stringify(body) },
+  );
+  controls.save.disabled = false;
+
+  if (!result.ok) {
+    controls.note.textContent = apiErrorMessage(result, "Could not save these changes.");
+    controls.note.classList.add("bad");
+    return;
+  }
+
+  const updated = result.data.site;
+  const index = listState.sites.findIndex((entry) => entry.key === site.key);
+  if (index >= 0) listState.sites[index] = updated;
+  const detail = listState.detail.get(site.key);
+  if (detail) listState.detail.set(site.key, { ...detail, summary: updated });
+
+  controls.note.textContent = `Saved ${new Date().toLocaleTimeString()}`;
+  syncSiteRow(updated);
+  renderListTotals();
+}
+
+function syncSiteRow(site) {
+  const row = [...document.querySelectorAll(".site")].find(
+    (node) => node.dataset.site === site.key,
+  );
+  if (!row) return;
+  const tag = row.querySelector("summary .status-tag");
+  if (!tag) return;
+  const meta = statusMeta(site.status);
+  tag.textContent = meta.label;
+  tag.dataset.tone = meta.tone;
+}
+
+function historyBlock(history, total = 0) {
+  const runs = Array.isArray(history) ? history : [];
+  if (runs.length === 0) {
+    return el("p", { class: "result-note", text: "No checks recorded for this site yet." });
+  }
+  const count = Math.max(total || 0, runs.length);
+  const title =
+    count > runs.length
+      ? `Run history (${runs.length} shown of ${count})`
+      : `Run history (${runs.length})`;
+
+  const rows = runs.map((run) => {
+    const verdict = verdictMeta(run.verdict);
+    const when = formatDate(run.at, {
+      day: "numeric",
+      month: "short",
+      year: "numeric",
+    });
+    const score = typeof run.need === "number" ? `need ${num(run.need)}` : "not scored";
+    const batchLink =
+      listState.owner && run.batch
+        ? el("a", {
+            class: "mono",
+            href: `/j/${run.batch}`,
+            text: `#${String(run.batch).slice(0, 8)}`,
+            title: "Open this batch",
+            onclick: (event) => {
+              event.preventDefault();
+              openJob(run.batch, { push: true });
+            },
+          })
+        : null;
+
+    return el("li", {}, [
+      el("span", { class: "verdict-tag small", "data-tone": verdict.tone, text: verdict.label }),
+      el("span", { class: "mono history-when", text: when }),
+      el("span", { class: "mono", text: score }),
+      batchLink,
+      el("span", { class: "history-reason", text: run.reason ?? "" }),
+    ]);
+  });
+
+  return section(title, el("ol", { class: "history" }, rows));
+}
+
+/* ------------------------------------------------------ selection & bulk */
+
+function togglePicked(key, checked) {
+  if (checked) listState.selected.add(key);
+  else listState.selected.delete(key);
+  renderBulk();
+}
+
+function renderBulk() {
+  const bar = $("list-bulk");
+  const active = listState.selecting && listState.owner && listState.sites.length > 0;
+  bar.hidden = !active;
+  $("list-select").textContent = listState.selecting ? "Stop selecting" : "Select";
+  $("bulk-count").textContent = `${listState.selected.size} selected`;
+  $("bulk-apply").disabled = listState.selected.size === 0;
+  $("bulk-remove").disabled = listState.selected.size === 0;
+}
+
+async function bulkStatus() {
+  const list = listState.list;
+  const keys = [...listState.selected];
+  if (!list || keys.length === 0) return;
+  const result = await listApi(`/v1/lists/${encodeURIComponent(list.id)}/bulk`, {
+    method: "POST",
+    body: JSON.stringify({ action: "status", status: $("bulk-status").value, keys }),
+  });
+  if (!result.ok) {
+    showListPageError(apiErrorMessage(result, "Could not update these sites."));
+    return;
+  }
+  listState.selected.clear();
+  listState.selecting = false;
+  await loadList(list.id);
+}
+
+function bulkRemove() {
+  const list = listState.list;
+  const keys = [...listState.selected];
+  if (!list || keys.length === 0) return;
+  const which = `${keys.length} ${keys.length === 1 ? "site" : "sites"}`;
+  openModal({
+    title: "Remove from list",
+    body: el("p", {
+      class: "hint",
+      text: `Remove ${which} from “${list.name}”? Their reports and history are deleted with them. The batch itself is not touched.`,
+    }),
+    actions: [
+      { label: "Cancel" },
+      {
+        label: "Remove",
+        kind: "danger",
+        onClick: async () => {
+          const result = await listApi(`/v1/lists/${encodeURIComponent(list.id)}/bulk`, {
+            method: "POST",
+            body: JSON.stringify({ action: "remove", keys }),
+          });
+          if (!result.ok) {
+            modalError(apiErrorMessage(result, "Could not remove these sites."));
+            return false;
+          }
+          listState.selected.clear();
+          listState.selecting = false;
+          await loadList(list.id);
+        },
+      },
+    ],
+  });
+}
+
+/* ------------------------------------------------------------- add a batch */
+
+function batchIdFrom(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  const match = /\/j\/([A-Za-z0-9_-]{20,32})/.exec(raw);
+  if (match) return match[1];
+  return /^[A-Za-z0-9_-]{20,32}$/.test(raw) ? raw : "";
+}
+
+function batchLabel(job) {
+  const bits = [];
+  if (job.createdAt) bits.push(shortDate(job.createdAt));
+  if (job.total) bits.push(`${job.total} ${job.total === 1 ? "site" : "sites"}`);
+  const first = job.firstUrl ? hostOf(job.firstUrl) : "";
+  if (first) bits.push(job.total > 1 ? `${first} and ${job.total - 1} more` : first);
+  if (job.imported) bits.push(`${job.imported} already in this list`);
+  return bits.join(" · ") || job.id.slice(0, 8);
+}
+
+async function openAddToList({ jobId = state.jobId, listId = null } = {}) {
+  let wanted = jobId ?? "";
+
+  const listsResult = await listApi("/v1/lists");
+  if (!listsResult.ok) {
+    openModal({
+      title: "Add to list",
+      body: el("p", { class: "form-error", text: apiErrorMessage(listsResult, "Could not load the lists.") }),
+    });
+    return;
+  }
+  listState.owner = Boolean(listsResult.data?.owner);
+  listState.management = listsResult.data?.management ?? "open";
+  if (!listState.owner) {
+    openKeyModal();
+    return;
+  }
+  listState.lists = Array.isArray(listsResult.data.lists) ? listsResult.data.lists : [];
+
+  const currentListId = listId ?? listState.list?.id ?? listState.lists[0]?.id ?? null;
+  let jobs = [];
+  if (currentListId) {
+    const batchResult = await listApi(`/v1/lists/${encodeURIComponent(currentListId)}/batches`);
+    if (batchResult.ok) jobs = Array.isArray(batchResult.data.jobs) ? batchResult.data.jobs : [];
+  }
+  if (wanted && !jobs.some((job) => job.id === wanted)) {
+    jobs.unshift({
+      id: wanted,
+      createdAt: state.job?.id === wanted ? state.job.createdAt : null,
+      total: state.job?.id === wanted ? state.job.total : 0,
+      firstUrl: state.job?.id === wanted ? (state.job.urls?.[0] ?? "") : "",
+    });
+  }
+  // Opened from a list page there is no current batch, so the picker starts at
+  // the newest one this list already knows about.
+  if (!wanted) wanted = jobs[0]?.id ?? "";
+
+  const batchSelect = el("select", { class: "select", "aria-label": "Batch to add" });
+  if (jobs.length === 0) {
+    batchSelect.append(el("option", { value: "", text: "No batches yet — paste a link below" }));
+  }
+  for (const job of jobs) {
+    const option = el("option", { value: job.id, text: batchLabel(job) });
+    if (job.id === wanted) option.selected = true;
+    batchSelect.append(option);
+  }
+
+  const manual = textInput({ placeholder: "or paste a batch link (/j/…)" });
+  const choiceHost = el("div", { class: "choice-grid" });
+  if (listState.lists.length === 0) {
+    choiceHost.append(el("p", { class: "hint", text: "You have no lists yet. Create one below." }));
+  }
+  for (const list of listState.lists) {
+    choiceHost.append(
+      choiceRow(
+        list,
+        list.id === currentListId,
+        `${list.siteCount} ${list.siteCount === 1 ? "site" : "sites"}`,
+      ),
+    );
+  }
+
+  const newName = textInput({ placeholder: "New list name" });
+  const create = el("button", { class: "btn btn-ghost", type: "button", text: "Create" });
+  create.addEventListener("click", async () => {
+    const name = newName.value.trim();
+    if (!name) {
+      newName.focus();
+      return;
+    }
+    create.disabled = true;
+    const result = await listApi("/v1/lists", { method: "POST", body: JSON.stringify({ name }) });
+    create.disabled = false;
+    if (!result.ok) {
+      modalError(apiErrorMessage(result, "Could not create the list."));
+      return;
+    }
+    const list = result.data.list;
+    listState.lists.push(list);
+    if (choiceHost.querySelector("p")) clear(choiceHost);
+    choiceHost.append(choiceRow(list, true, "new"));
+    newName.value = "";
+  });
+
+  openModal({
+    title: "Add a batch to a list",
+    body: [
+      el("p", {
+        class: "hint",
+        text: "Choose a finished batch and one or more lists. Nothing is added by itself, and the batch itself stays disposable.",
+      }),
+      field("Batch", batchSelect),
+      field("Other batch", manual),
+      el("h3", { class: "section-title", text: "Add to these lists" }),
+      choiceHost,
+      el("div", { class: "inline-create" }, [newName, create]),
+    ],
+    actions: [
+      {
+        label: "Add to list",
+        kind: "primary",
+        onClick: async () => {
+          const targetIds = choicesFrom(choiceHost);
+          if (targetIds.length === 0) {
+            modalError("Choose at least one list.");
+            return false;
+          }
+          const typed = manual.value.trim();
+          const manualId = batchIdFrom(typed);
+          if (typed && !manualId) {
+            modalError("That does not look like a batch link. Copy the address of the batch page.");
+            return false;
+          }
+          const chosen = manualId || batchSelect.value;
+          if (!chosen) {
+            modalError("Choose a batch.");
+            return false;
+          }
+
+          const result = await listApi("/v1/lists/import", {
+            method: "POST",
+            body: JSON.stringify({ jobId: chosen, listIds: targetIds }),
+          });
+          if (!result.ok) {
+            modalError(apiErrorMessage(result, "The batch could not be added."));
+            return false;
+          }
+
+          const rows = (result.data.results ?? []).map((entry) => ({
+            name: listName(entry.listId),
+            ok: entry.ok !== false,
+            text:
+              entry.ok === false
+                ? entry.error
+                : `${entry.added} added · ${entry.updated} updated · ${entry.unchanged} already there`,
+          }));
+          const batch = result.data.batch ?? {};
+          modalResults(
+            "Batch added",
+            rows,
+            batch.ready !== undefined
+              ? `${batch.ready} of ${batch.total} websites in this batch had a report.`
+              : null,
+          );
+          if (listState.list && targetIds.includes(listState.list.id)) {
+            await loadList(listState.list.id);
+          }
+          return false;
+        },
+      },
+    ],
+  });
+}
+
+/* -------------------------------------------------------------- importing */
+
+async function openImportModal({ listId = listState.list?.id ?? null } = {}) {
+  const listsResult = await listApi("/v1/lists");
+  if (!listsResult.ok) {
+    openModal({
+      title: "Import",
+      body: el("p", { class: "form-error", text: apiErrorMessage(listsResult, "Could not load the lists.") }),
+    });
+    return;
+  }
+  listState.owner = Boolean(listsResult.data?.owner);
+  listState.management = listsResult.data?.management ?? "open";
+  if (!listState.owner) {
+    openKeyModal();
+    return;
+  }
+  listState.lists = Array.isArray(listsResult.data.lists) ? listsResult.data.lists : [];
+
+  if (listState.lists.length === 0) {
+    openModal({
+      title: "Import",
+      body: el("p", { class: "hint", text: "Create a list first, then import reports into it." }),
+    });
+    return;
+  }
+
+  const file = el("input", { type: "file", accept: ".json,application/json" });
+  const text = el("textarea", {
+    class: "import-text",
+    spellcheck: "false",
+    placeholder: '[ { "input_url": "https://…", "verdict": "REACH_OUT", … } ]',
+  });
+  file.addEventListener("change", () => {
+    const chosen = file.files?.[0];
+    if (!chosen) return;
+    const reader = new FileReader();
+    reader.addEventListener("load", () => {
+      text.value = String(reader.result ?? "");
+    });
+    reader.addEventListener("error", () => modalError("That file could not be read."));
+    reader.readAsText(chosen);
+  });
+
+  const choiceHost = el("div", { class: "choice-grid" });
+  for (const list of listState.lists) {
+    choiceHost.append(
+      choiceRow(
+        list,
+        list.id === listId,
+        `${list.siteCount} ${list.siteCount === 1 ? "site" : "sites"}`,
+      ),
+    );
+  }
+
+  openModal({
+    title: "Import",
+    body: [
+      el("p", {
+        class: "hint",
+        text: "Load a report.json from the command line tool, or a SiteScout backup file. Reports are merged into the list you choose; nothing is overwritten blindly.",
+      }),
+      field("File", file),
+      text,
+      el("h3", { class: "section-title", text: "Import into" }),
+      choiceHost,
+    ],
+    actions: [
+      {
+        label: "Import",
+        kind: "primary",
+        onClick: async () => {
+          const raw = text.value.trim();
+          if (!raw) {
+            modalError("Paste the contents of report.json, or choose the file.");
+            return false;
+          }
+
+          let parsed;
+          try {
+            parsed = JSON.parse(raw);
+          } catch {
+            modalError("That is not valid JSON.");
+            return false;
+          }
+
+          const targetIds = choicesFrom(choiceHost);
+          if (targetIds.length === 0) {
+            modalError("Choose at least one list.");
+            return false;
+          }
+
+          const reports = Array.isArray(parsed)
+            ? parsed
+            : Array.isArray(parsed?.reports)
+              ? parsed.reports
+              : null;
+          const backup = !reports && parsed && Array.isArray(parsed.sites) ? parsed : null;
+
+          if (!reports && !backup) {
+            modalError(
+              "Expected an array of reports from report.json, or a SiteScout backup file (with a “sites” array).",
+            );
+            return false;
+          }
+
+          if (backup) {
+            await runRestore(backup, targetIds);
+            return false;
+          }
+
+          const totals = new Map(
+            targetIds.map((id) => [id, { added: 0, updated: 0, unchanged: 0, failed: 0, error: null }]),
+          );
+          const chunkSize = 25;
+          for (let index = 0; index < reports.length; index += chunkSize) {
+            const chunk = reports.slice(index, index + chunkSize);
+            const result = await listApi("/v1/lists/reports", {
+              method: "POST",
+              body: JSON.stringify({ reports: chunk, listIds: targetIds }),
+            });
+            if (!result.ok) {
+              modalError(apiErrorMessage(result, "The reports could not be imported."));
+              return false;
+            }
+            for (const entry of result.data.results ?? []) {
+              const total = totals.get(entry.listId);
+              if (!total) continue;
+              if (entry.ok === false) total.error = entry.error;
+              else {
+                total.added += entry.added ?? 0;
+                total.updated += entry.updated ?? 0;
+                total.unchanged += entry.unchanged ?? 0;
+                total.failed += entry.failed ?? 0;
+              }
+            }
+          }
+
+          modalResults(
+            "Report.json imported",
+            [...totals.entries()].map(([id, row]) => ({
+              name: listName(id),
+              ok: !row.error,
+              text:
+                row.error ??
+                `${row.added} added · ${row.updated} updated · ${row.unchanged} already there${
+                  row.failed ? ` · ${row.failed} skipped` : ""
+                }`,
+            })),
+            `${reports.length} ${reports.length === 1 ? "report" : "reports"} read.`,
+          );
+          if (listState.list && targetIds.includes(listState.list.id)) {
+            await loadList(listState.list.id);
+          }
+          return false;
+        },
+      },
+    ],
+  });
+}
+
+async function runRestore(backup, targetIds) {
+  const sites = backup.sites ?? [];
+  const batches = Array.isArray(backup.batches) ? backup.batches : [];
+  const rows = [];
+  const chunkSize = 15;
+
+  for (const id of targetIds) {
+    let restored = 0;
+    let skipped = 0;
+    let error = null;
+
+    for (let index = 0; index < sites.length && !error; index += chunkSize) {
+      const chunk = sites.slice(index, index + chunkSize);
+      const chunkResult = await listApi(`/v1/lists/${encodeURIComponent(id)}/restore`, {
+        method: "POST",
+        body: JSON.stringify({
+          sites: chunk,
+          batches: index === 0 ? batches : [],
+        }),
+      });
+      if (!chunkResult.ok) {
+        error = apiErrorMessage(chunkResult, "Could not restore this list.");
+        break;
+      }
+      restored += chunkResult.data.restored ?? 0;
+      skipped += chunkResult.data.skipped ?? 0;
+    }
+
+    rows.push({
+      name: listName(id),
+      ok: !error,
+      text: error ?? `${restored} restored · ${skipped} skipped (already there)`,
+    });
+  }
+
+  modalResults(
+    "Backup restored",
+    rows,
+    `${sites.length} ${sites.length === 1 ? "site" : "sites"} in this backup.`,
+  );
+  if (listState.list && targetIds.includes(listState.list.id)) {
+    await loadList(listState.list.id);
+  }
+}
+
+/* --------------------------------------------------------------- exporting */
+
+async function exportCsv() {
+  const list = listState.list;
+  if (!list) return;
+  const button = $("list-export");
+  button.disabled = true;
+  try {
+    const response = await fetch(`/v1/lists/${encodeURIComponent(list.id)}/export.csv`, {
+      headers: listHeaders(),
+    });
+    if (!response.ok) {
+      let message = `HTTP ${response.status}`;
+      try {
+        const data = await response.json();
+        if (typeof data?.error === "string") message = data.error;
+      } catch {
+        // not JSON; keep the status text
+      }
+      showListPageError(message);
+      return;
+    }
+    downloadBlob(`sitescout-${slug(list.name)}.csv`, await response.blob());
+  } catch {
+    showListPageError("Could not reach the server to build the CSV.");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function backupList() {
+  const list = listState.list;
+  if (!list) return;
+  const button = $("list-backup");
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = "Preparing…";
+
+  try {
+    const keys = listState.sites.map((site) => site.key);
+    const sites = [];
+    for (let index = 0; index < keys.length; index += 40) {
+      const result = await listApi(`/v1/lists/${encodeURIComponent(list.id)}/sites`, {
+        method: "POST",
+        body: JSON.stringify({ keys: keys.slice(index, index + 40) }),
+      });
+      if (!result.ok) {
+        showListPageError(apiErrorMessage(result, "Could not read the sites for the backup."));
+        return;
+      }
+      sites.push(...(result.data.sites ?? []));
+    }
+
+    const payload = {
+      format: "sitescout-list-backup",
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      list: {
+        name: list.name,
+        description: list.description,
+        visibility: list.visibility,
+      },
+      batches: listState.batches,
+      sites,
+    };
+    downloadText(
+      `sitescout-${slug(list.name)}-backup.json`,
+      JSON.stringify(payload, null, 2),
+    );
+  } catch {
+    showListPageError("Could not reach the server to build the backup.");
+  } finally {
+    button.disabled = false;
+    button.textContent = label;
+  }
+}
+
+/* ------------------------------------------------------------- create/manage */
+
+function openCreateList() {
+  const name = textInput({ placeholder: "Amsterdam bakeries", maxlength: "80" });
+  const description = textInput({
+    placeholder: "Optional: what this list is for",
+    maxlength: "200",
+  });
+  const visibility = el("select", { class: "select" });
+  visibility.append(el("option", { value: "public", text: "Public — shown on the Lists page" }));
+  visibility.append(
+    el("option", { value: "unlisted", text: "Unlisted — only people with the link" }),
+  );
+  if (listState.management === "key") {
+    visibility.append(
+      el("option", { value: "private", text: "Private — management key needed to read" }),
+    );
+  }
+
+  openModal({
+    title: "New list",
+    body: [
+      field("Name", name),
+      field("Description", description),
+      field("Who can see it", visibility),
+    ],
+    actions: [
+      {
+        label: "Create list",
+        kind: "primary",
+        onClick: async () => {
+          if (!name.value.trim()) {
+            modalError("Give the list a name.");
+            return false;
+          }
+          const result = await listApi("/v1/lists", {
+            method: "POST",
+            body: JSON.stringify({
+              name: name.value,
+              description: description.value,
+              visibility: visibility.value,
+            }),
+          });
+          if (!result.ok) {
+            modalError(apiErrorMessage(result, "Could not create the list."));
+            return false;
+          }
+          const list = result.data.list;
+          listState.lists.unshift(list);
+          await openList(list.id, { push: true });
+        },
+      },
+    ],
+  });
+  name.focus();
+}
+
+function openManageList() {
+  const list = listState.list;
+  if (!list) return;
+
+  const name = textInput({ value: list.name, maxlength: "80" });
+  const description = textInput({ value: list.description ?? "", maxlength: "200" });
+  const visibility = el("select", { class: "select" });
+  for (const option of [
+    { value: "public", label: "Public — shown on the Lists page" },
+    { value: "unlisted", label: "Unlisted — only people with the link" },
+    ...(listState.management === "key"
+      ? [{ value: "private", label: "Private — management key needed to read" }]
+      : []),
+  ]) {
+    const node = el("option", { value: option.value, text: option.label });
+    if (option.value === list.visibility) node.selected = true;
+    visibility.append(node);
+  }
+
+  openModal({
+    title: "Manage list",
+    body: [
+      field("Name", name),
+      field("Description", description),
+      field("Who can see it", visibility),
+      el("div", { class: "danger-zone" }, [
+        el("h3", { class: "section-title", text: "Careful" }),
+        el("div", { class: "danger-row" }, [
+          el("p", { class: "hint", text: "Empty the list but keep it, including its name and settings." }),
+          el("button", {
+            class: "btn btn-ghost",
+            type: "button",
+            text: "Remove every site",
+            onclick: () =>
+              confirmAction({
+                title: "Remove every site",
+                message: `Remove all ${list.siteCount} ${list.siteCount === 1 ? "site" : "sites"} from “${list.name}”? The reports are deleted; the batches are not touched.`,
+                label: "Remove them",
+                run: async () => {
+                  const result = await listApi(
+                    `/v1/lists/${encodeURIComponent(list.id)}/clear`,
+                    { method: "POST", body: "{}" },
+                  );
+                  if (!result.ok) {
+                    modalError(apiErrorMessage(result, "Could not empty the list."));
+                    return false;
+                  }
+                  await loadList(list.id);
+                },
+              }),
+          }),
+        ]),
+        el("div", { class: "danger-row" }, [
+          el("p", { class: "hint", text: "Delete the list and everything in it. This cannot be undone." }),
+          el("button", {
+            class: "btn btn-danger",
+            type: "button",
+            text: "Delete list",
+            onclick: () =>
+              confirmAction({
+                title: "Delete list",
+                message: `Delete “${list.name}” and its ${list.siteCount} ${list.siteCount === 1 ? "site" : "sites"}? This cannot be undone.`,
+                label: "Delete",
+                run: async () => {
+                  const result = await listApi(`/v1/lists/${encodeURIComponent(list.id)}`, {
+                    method: "DELETE",
+                  });
+                  if (!result.ok) {
+                    modalError(apiErrorMessage(result, "Could not delete the list."));
+                    return false;
+                  }
+                  await openLists({ push: true });
+                },
+              }),
+          }),
+        ]),
+      ]),
+    ],
+    actions: [
+      {
+        label: "Save changes",
+        kind: "primary",
+        onClick: async () => {
+          if (!name.value.trim()) {
+            modalError("The list needs a name.");
+            return false;
+          }
+          const result = await listApi(`/v1/lists/${encodeURIComponent(list.id)}`, {
+            method: "PATCH",
+            body: JSON.stringify({
+              name: name.value,
+              description: description.value,
+              visibility: visibility.value,
+            }),
+          });
+          if (!result.ok) {
+            modalError(apiErrorMessage(result, "Could not save the list."));
+            return false;
+          }
+          listState.list = { ...listState.list, ...result.data.list };
+          renderList();
+        },
+      },
+    ],
+  });
+  name.focus();
+}
+
+function confirmAction({ title, message, label, run }) {
+  openModal({
+    title,
+    body: el("p", { class: "hint", text: message }),
+    actions: [
+      { label: "Cancel" },
+      {
+        label,
+        kind: "danger",
+        onClick: async () => {
+          const keep = await run();
+          return keep === false ? false : undefined;
+        },
+      },
+    ],
+  });
+}
+
 /* ------------------------------------------------------------------ wiring */
 
 $("batch-form").addEventListener("submit", submitBatch);
@@ -994,6 +2592,7 @@ $("clear-recent").addEventListener("click", () => {
 });
 $("retry").addEventListener("click", retryJob);
 $("copy-link").addEventListener("click", copyLink);
+$("job-add-list").addEventListener("click", () => openAddToList());
 $("new-batch").addEventListener("click", () => goHome(true));
 $("search").addEventListener("input", (event) => {
   state.query = event.target.value;
@@ -1011,7 +2610,75 @@ document.querySelectorAll("[data-home]").forEach((link) => {
   });
 });
 
+document.querySelectorAll("[data-lists]").forEach((link) => {
+  link.addEventListener("click", (event) => {
+    event.preventDefault();
+    openLists({ push: true });
+  });
+});
+
+/* ------------------------------------------------------------- list wiring */
+
+$("lists-new").addEventListener("click", () => openCreateList());
+$("lists-unlock").addEventListener("click", openKeyModal);
+$("lists-import").addEventListener("click", () => openImportModal({}));
+$("list-add-batch").addEventListener("click", () => openAddToList({}));
+$("list-export").addEventListener("click", exportCsv);
+$("list-backup").addEventListener("click", backupList);
+$("list-import").addEventListener("click", () => openImportModal({}));
+$("list-manage").addEventListener("click", openManageList);
+$("list-unlock").addEventListener("click", openKeyModal);
+$("modal-close").addEventListener("click", closeModal);
+
+$("modal").addEventListener("click", (event) => {
+  // Clicking the dimmed area outside the panel closes the dialog.
+  if (event.target === $("modal")) closeModal();
+});
+
+$("list-search").addEventListener("input", (event) => {
+  listState.query = event.target.value;
+  renderListSites();
+});
+$("list-verdict").addEventListener("change", (event) => {
+  listState.verdict = event.target.value;
+  renderListSites();
+});
+$("list-status").addEventListener("change", (event) => {
+  listState.status = event.target.value;
+  renderListSites();
+});
+$("list-sort").addEventListener("change", (event) => {
+  listState.sort = event.target.value;
+  renderListSites();
+});
+
+$("list-select").addEventListener("click", () => {
+  listState.selecting = !listState.selecting;
+  listState.selected.clear();
+  renderListSites();
+});
+$("bulk-all").addEventListener("click", () => {
+  for (const site of visibleSites()) listState.selected.add(site.key);
+  renderListSites();
+});
+$("bulk-apply").addEventListener("click", bulkStatus);
+$("bulk-remove").addEventListener("click", bulkRemove);
+$("bulk-cancel").addEventListener("click", () => {
+  listState.selecting = false;
+  listState.selected.clear();
+  renderListSites();
+});
+
 window.addEventListener("popstate", () => {
+  const listMatch = /^\/l\/([A-Za-z0-9_-]{20,32})\/?$/.exec(location.pathname);
+  if (listMatch) {
+    openList(listMatch[1]);
+    return;
+  }
+  if (/^\/lists\/?$/.test(location.pathname)) {
+    openLists();
+    return;
+  }
   const match = /^\/j\/([A-Za-z0-9_-]{20,32})\/?$/.exec(location.pathname);
   if (match) {
     openJob(match[1]);
@@ -1035,6 +2702,9 @@ document.addEventListener("visibilitychange", () => {
 renderRecent();
 updateCount();
 
+const listDeepLink = /^\/l\/([A-Za-z0-9_-]{20,32})\/?$/.exec(location.pathname);
 const deepLink = /^\/j\/([A-Za-z0-9_-]{20,32})\/?$/.exec(location.pathname);
-if (deepLink) openJob(deepLink[1]);
+if (listDeepLink) openList(listDeepLink[1]);
+else if (/^\/lists\/?$/.test(location.pathname)) openLists();
+else if (deepLink) openJob(deepLink[1]);
 else setView("home");

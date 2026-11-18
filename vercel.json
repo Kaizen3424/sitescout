@@ -5,6 +5,16 @@
       "maxDuration": 300
     }
   },
+  "headers": [
+    {
+      "source": "/lists",
+      "headers": [{ "key": "X-Robots-Tag", "value": "noindex" }]
+    },
+    {
+      "source": "/l/:id",
+      "headers": [{ "key": "X-Robots-Tag", "value": "noindex" }]
+    }
+  ],
   "rewrites": [
     {
       "source": "/health",
@@ -37,6 +47,58 @@
     {
       "source": "/v1/jobs/:id",
       "destination": "/api?__route=job&jobId=:id"
+    },
+    {
+      "source": "/v1/lists",
+      "destination": "/api?__route=lists"
+    },
+    {
+      "source": "/v1/lists/import",
+      "destination": "/api?__route=lists_import"
+    },
+    {
+      "source": "/v1/lists/reports",
+      "destination": "/api?__route=lists_reports"
+    },
+    {
+      "source": "/v1/lists/:id/batches",
+      "destination": "/api?__route=list_batches&listId=:id"
+    },
+    {
+      "source": "/v1/lists/:id/sites/:key",
+      "destination": "/api?__route=list_site&listId=:id&siteKey=:key"
+    },
+    {
+      "source": "/v1/lists/:id/sites",
+      "destination": "/api?__route=list_sites&listId=:id"
+    },
+    {
+      "source": "/v1/lists/:id/bulk",
+      "destination": "/api?__route=list_bulk&listId=:id"
+    },
+    {
+      "source": "/v1/lists/:id/clear",
+      "destination": "/api?__route=list_clear&listId=:id"
+    },
+    {
+      "source": "/v1/lists/:id/restore",
+      "destination": "/api?__route=list_restore&listId=:id"
+    },
+    {
+      "source": "/v1/lists/:id/export.csv",
+      "destination": "/api?__route=list_csv&listId=:id"
+    },
+    {
+      "source": "/v1/lists/:id",
+      "destination": "/api?__route=list&listId=:id"
+    },
+    {
+      "source": "/lists",
+      "destination": "/web/index.html"
+    },
+    {
+      "source": "/l/:id",
+      "destination": "/web/index.html"
     },
     {
       "source": "/j/:id",

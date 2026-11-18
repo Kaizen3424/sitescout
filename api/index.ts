@@ -5,7 +5,7 @@
  */
 import { timingSafeEqual } from "node:crypto";
 import { API_VERSION } from "./_lib/env.js";
-import { ConfigError, FatalApiError, InvalidUrlError, SiteScoutError } from "./_lib/errors.js";
+import { ConfigError, FatalApiError, InvalidUrlError, ListError, SiteScoutError } from "./_lib/errors.js";
 import {
   consumeQuota,
   createJob,
@@ -13,9 +13,27 @@ import {
   isValidJobId,
   loadJobConfig,
   readJob,
+  readJobEntries,
+  readMeta,
   verifyCallback,
   type JobView,
 } from "./_lib/jobs.js";
+import {
+  MAX_BULK_KEYS,
+  MAX_DETAIL_KEYS,
+  MAX_REPORT_IMPORTS,
+  getListStore,
+  isValidListId,
+  listSettings,
+  publicHistory,
+  publicReport,
+  publicSummary,
+  validateKeyList,
+  validateStatus,
+  type ListMeta,
+  type ListSettings,
+  type ManagementMode,
+} from "./_lib/lists.js";
 import { processJobItem } from "./_lib/jobrunner.js";
 import { analyzeUrl, failedReport, type AnalyzeDeps } from "./_lib/pipeline.js";
 import { baseReport, verdictTotals } from "./_lib/report.js";
@@ -113,6 +131,22 @@ async function health(): Promise<Response> {
     } catch (err) {
       console.warn(`health: quota snapshot failed: ${err instanceof Error ? err.message : String(err)}`);
     }
+    let lists: Record<string, unknown> | null = null;
+    try {
+      const settings = listSettings();
+      const store = getListStore();
+      const all = await store.readLists();
+      const counts = await Promise.all(all.map((list) => store.siteCount(list.id)));
+      lists = {
+        management: settings.management,
+        count: all.length,
+        sites: counts.reduce((sum, count) => sum + count, 0),
+        max_lists: settings.maxLists,
+        max_sites_per_list: settings.maxSitesPerList,
+      };
+    } catch (err) {
+      console.warn(`health: lists snapshot failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
     return json({
       ok: true,
       version: API_VERSION,
@@ -124,6 +158,7 @@ async function health(): Promise<Response> {
         gemini: runtime.gemini.summary(),
       },
       quota,
+      lists,
       limits: {
         max_urls: runtime.settings.maxUrls,
         concurrency: runtime.settings.concurrency,
@@ -382,6 +417,22 @@ async function handleCreateJob(request: Request): Promise<Response> {
   let job: JobView;
   try {
     const meta = await createJob(urls, parsed.fresh, config);
+    // Remember the batch for the "Add batch" picker on the lists page. This is
+    // only metadata: the batch itself is never added to a list automatically.
+    try {
+      await getListStore().registerJob({
+        id: meta.id,
+        createdAt: meta.createdAt,
+        total: meta.total,
+        firstUrl: meta.urls[0] ?? "",
+      });
+    } catch (err) {
+      console.warn(
+        `could not register the batch for the list picker: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
     if (config.inline) {
       // Development convenience: no public URL is reachable by QStash, so run
       // the batch inside the request. Keep batches small when you use this.
@@ -522,30 +573,562 @@ async function handleJobReport(jobId: string): Promise<Response> {
   }
 }
 
+/* ------------------------------------------------------- /v1/lists (permanent) */
+
+interface ListAccess {
+  owner: boolean;
+  mode: ManagementMode;
+}
+
+interface ListContext {
+  store: ReturnType<typeof getListStore>;
+  settings: ListSettings;
+  access: ListAccess;
+}
+
+/**
+ * Reading is public; changing needs the key. When no key is configured the
+ * project is a one-person tool and the link itself is the secret.
+ */
+function listAccess(request: Request, settings: ListSettings): ListAccess {
+  if (settings.management === "open") return { owner: true, mode: "open" };
+  if (settings.management === "disabled") return { owner: false, mode: "disabled" };
+  const provided = (request.headers.get("x-sitescout-list-key") ?? "").trim();
+  if (!provided) return { owner: false, mode: "key" };
+  if (!tokenMatches(provided, settings.key)) {
+    throw new ListError("That management key is not right.", 401, { code: "bad_key" });
+  }
+  return { owner: true, mode: "key" };
+}
+
+function listFailure(err: unknown): Response {
+  if (err instanceof ListError) return failure(err.message, err.status, err.extra);
+  if (err instanceof ConfigError) return failure(err.message, 503);
+  return serverError(err);
+}
+
+function listContext(request: Request): ListContext | Response {
+  try {
+    const settings = listSettings();
+    return { store: getListStore(), settings, access: listAccess(request, settings) };
+  } catch (err) {
+    return listFailure(err);
+  }
+}
+
+function requireOwner(ctx: ListContext): Response | null {
+  if (ctx.access.owner) return null;
+  if (ctx.settings.management === "disabled") {
+    return failure(
+      "List management is switched off: SITESCOUT_LIST_KEY is shorter than 24 characters.",
+      503,
+    );
+  }
+  return failure("This action needs the management key. Unlock the list first.", 401, {
+    code: "needs_key",
+  });
+}
+
+async function jsonBody(request: Request): Promise<Record<string, unknown>> {
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    throw new ListError("Body is not valid JSON.", 400);
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw new ListError("Body must be a JSON object.", 400);
+  }
+  return body as Record<string, unknown>;
+}
+
+function listView(meta: ListMeta, siteCount: number): Record<string, unknown> {
+  return { ...meta, siteCount };
+}
+
+async function handleListsIndex(request: Request): Promise<Response> {
+  const ctx = listContext(request);
+  if (ctx instanceof Response) return ctx;
+  try {
+    await ctx.store.checkRate("read", clientIp(request));
+    const jobId = (new URL(request.url).searchParams.get("jobId") ?? "").trim();
+    const lists = await ctx.store.readLists();
+    const visible = ctx.access.owner
+      ? lists
+      : lists.filter((list) => list.visibility === "public");
+    const counts = await Promise.all(visible.map((list) => ctx.store.siteCount(list.id)));
+
+    let imported: Map<string, number> | null = null;
+    if (jobId && ctx.access.owner && isValidJobId(jobId)) {
+      const records = await Promise.all(visible.map((list) => ctx.store.readBatches(list.id)));
+      imported = new Map<string, number>();
+      visible.forEach((list, index) => {
+        const record = records[index]?.find((entry) => entry.id === jobId);
+        imported!.set(list.id, record?.imported.length ?? 0);
+      });
+    }
+
+    return json({
+      ok: true,
+      owner: ctx.access.owner,
+      management: ctx.access.mode,
+      lists: visible.map((list, index) => ({
+        ...listView(list, counts[index] ?? 0),
+        ...(imported ? { imported: imported.get(list.id) ?? 0 } : {}),
+      })),
+    });
+  } catch (err) {
+    return listFailure(err);
+  }
+}
+
+async function handleCreateList(request: Request): Promise<Response> {
+  const ctx = listContext(request);
+  if (ctx instanceof Response) return ctx;
+  const denied = requireOwner(ctx);
+  if (denied) return denied;
+  try {
+    await ctx.store.checkRate("write", clientIp(request));
+    const body = await jsonBody(request);
+    const meta = await ctx.store.createList({
+      name: body.name,
+      description: body.description,
+      visibility: body.visibility,
+    });
+    return json(
+      { ok: true, owner: true, management: ctx.access.mode, list: listView(meta, 0) },
+      201,
+    );
+  } catch (err) {
+    return listFailure(err);
+  }
+}
+
+/** Loads a list and enforces private visibility for non-owners. */
+async function visibleList(ctx: ListContext, listId: string): Promise<ListMeta> {
+  const meta = await ctx.store.readList(listId);
+  if (!meta) throw new ListError("That list does not exist.", 404);
+  if (meta.visibility === "private" && !ctx.access.owner) {
+    // Same answer as a missing list, so private lists are not discoverable.
+    throw new ListError("That list does not exist.", 404);
+  }
+  return meta;
+}
+
+async function handleReadList(request: Request, listId: string): Promise<Response> {
+  const ctx = listContext(request);
+  if (ctx instanceof Response) return ctx;
+  try {
+    await ctx.store.checkRate("read", clientIp(request));
+    const meta = await visibleList(ctx, listId);
+    const summaries = await ctx.store.readSummaries(listId);
+    const batches = ctx.access.owner ? await ctx.store.readBatches(listId) : null;
+    return json({
+      ok: true,
+      owner: ctx.access.owner,
+      management: ctx.access.mode,
+      list: listView(meta, summaries.length),
+      sites: ctx.access.owner ? summaries : summaries.map(publicSummary),
+      ...(batches ? { batches } : {}),
+    });
+  } catch (err) {
+    return listFailure(err);
+  }
+}
+
+async function handleUpdateList(request: Request, listId: string): Promise<Response> {
+  const ctx = listContext(request);
+  if (ctx instanceof Response) return ctx;
+  const denied = requireOwner(ctx);
+  if (denied) return denied;
+  try {
+    await ctx.store.checkRate("write", clientIp(request));
+    await visibleList(ctx, listId);
+    const body = await jsonBody(request);
+    const meta = await ctx.store.updateList(listId, {
+      name: body.name,
+      description: body.description,
+      visibility: body.visibility,
+    });
+    return json({
+      ok: true,
+      owner: true,
+      management: ctx.access.mode,
+      list: listView(meta, await ctx.store.siteCount(listId)),
+    });
+  } catch (err) {
+    return listFailure(err);
+  }
+}
+
+async function handleDeleteList(request: Request, listId: string): Promise<Response> {
+  const ctx = listContext(request);
+  if (ctx instanceof Response) return ctx;
+  const denied = requireOwner(ctx);
+  if (denied) return denied;
+  try {
+    await ctx.store.checkRate("write", clientIp(request));
+    await visibleList(ctx, listId);
+    await ctx.store.deleteList(listId);
+    return json({ ok: true, owner: true, deleted: listId });
+  } catch (err) {
+    return listFailure(err);
+  }
+}
+
+async function handleReadSite(
+  request: Request,
+  listId: string,
+  siteKey: string,
+): Promise<Response> {
+  const ctx = listContext(request);
+  if (ctx instanceof Response) return ctx;
+  try {
+    await ctx.store.checkRate("read", clientIp(request));
+    await visibleList(ctx, listId);
+    const detail = await ctx.store.readSite(listId, siteKey);
+    if (!detail) throw new ListError("That site is not in this list.", 404);
+    return json({
+      ok: true,
+      owner: ctx.access.owner,
+      management: ctx.access.mode,
+      site: ctx.access.owner
+        ? detail
+        : {
+            summary: publicSummary(detail.summary),
+            report: publicReport(detail.report),
+            history: publicHistory(detail.history),
+          },
+    });
+  } catch (err) {
+    return listFailure(err);
+  }
+}
+
+async function handleUpdateSite(
+  request: Request,
+  listId: string,
+  siteKey: string,
+): Promise<Response> {
+  const ctx = listContext(request);
+  if (ctx instanceof Response) return ctx;
+  const denied = requireOwner(ctx);
+  if (denied) return denied;
+  try {
+    await ctx.store.checkRate("write", clientIp(request));
+    await visibleList(ctx, listId);
+    const body = await jsonBody(request);
+    const summary = await ctx.store.updateSite(listId, siteKey, {
+      status: body.status,
+      notes: body.notes,
+      tags: body.tags,
+    });
+    return json({ ok: true, owner: true, site: summary });
+  } catch (err) {
+    return listFailure(err);
+  }
+}
+
+async function handleDeleteSite(
+  request: Request,
+  listId: string,
+  siteKey: string,
+): Promise<Response> {
+  const ctx = listContext(request);
+  if (ctx instanceof Response) return ctx;
+  const denied = requireOwner(ctx);
+  if (denied) return denied;
+  try {
+    await ctx.store.checkRate("write", clientIp(request));
+    await visibleList(ctx, listId);
+    await ctx.store.removeSite(listId, siteKey);
+    return json({ ok: true, owner: true, removed: siteKey });
+  } catch (err) {
+    return listFailure(err);
+  }
+}
+
+/** Full details in chunks: used by the JSON export. */
+async function handleReadSites(request: Request, listId: string): Promise<Response> {
+  const ctx = listContext(request);
+  if (ctx instanceof Response) return ctx;
+  const denied = requireOwner(ctx);
+  if (denied) return denied;
+  try {
+    await ctx.store.checkRate("read", clientIp(request));
+    await visibleList(ctx, listId);
+    const body = await jsonBody(request);
+    const keys = validateKeyList(body.keys, MAX_DETAIL_KEYS);
+    return json({ ok: true, sites: await ctx.store.details(listId, keys) });
+  } catch (err) {
+    return listFailure(err);
+  }
+}
+
+async function handleListBulk(request: Request, listId: string): Promise<Response> {
+  const ctx = listContext(request);
+  if (ctx instanceof Response) return ctx;
+  const denied = requireOwner(ctx);
+  if (denied) return denied;
+  try {
+    await ctx.store.checkRate("write", clientIp(request));
+    await visibleList(ctx, listId);
+    const body = await jsonBody(request);
+    const keys = validateKeyList(body.keys, MAX_BULK_KEYS);
+    if (body.action === "remove") {
+      const removed = await ctx.store.removeSites(listId, keys);
+      return json({ ok: true, removed, skipped: keys.length - removed });
+    }
+    if (body.action === "status") {
+      const status = validateStatus(body.status);
+      const changed = await ctx.store.setStatusMany(listId, keys, status);
+      return json({ ok: true, changed, skipped: keys.length - changed });
+    }
+    throw new ListError('Action must be "status" or "remove".', 400);
+  } catch (err) {
+    return listFailure(err);
+  }
+}
+
+async function handleClearList(request: Request, listId: string): Promise<Response> {
+  const ctx = listContext(request);
+  if (ctx instanceof Response) return ctx;
+  const denied = requireOwner(ctx);
+  if (denied) return denied;
+  try {
+    await ctx.store.checkRate("write", clientIp(request));
+    await visibleList(ctx, listId);
+    const removed = await ctx.store.clearList(listId);
+    return json({ ok: true, removed });
+  } catch (err) {
+    return listFailure(err);
+  }
+}
+
+async function handleRestoreList(request: Request, listId: string): Promise<Response> {
+  const ctx = listContext(request);
+  if (ctx instanceof Response) return ctx;
+  const denied = requireOwner(ctx);
+  if (denied) return denied;
+  try {
+    await ctx.store.checkRate("write", clientIp(request));
+    await visibleList(ctx, listId);
+    const body = await jsonBody(request);
+    const sites = Array.isArray(body.sites) ? body.sites : [];
+    const batches = Array.isArray(body.batches) ? body.batches : [];
+    if (sites.length === 0) throw new ListError("Nothing to restore in this chunk.", 400);
+    const result = await ctx.store.restore(listId, sites, batches);
+    return json({ ok: true, ...result });
+  } catch (err) {
+    return listFailure(err);
+  }
+}
+
+async function handleListCsv(request: Request, listId: string): Promise<Response> {
+  const ctx = listContext(request);
+  if (ctx instanceof Response) return ctx;
+  const denied = requireOwner(ctx);
+  if (denied) return denied;
+  try {
+    await ctx.store.checkRate("read", clientIp(request));
+    const meta = await visibleList(ctx, listId);
+    const csv = await ctx.store.csv(listId);
+    return new Response(csv, {
+      status: 200,
+      headers: {
+        "content-type": "text/csv; charset=utf-8",
+        "content-disposition": `attachment; filename="sitescout-${meta.name
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/^-|-$/g, "") || "list"}.csv"`,
+        "cache-control": "no-store",
+      },
+    });
+  } catch (err) {
+    return listFailure(err);
+  }
+}
+
+async function handleListBatches(request: Request, listId: string): Promise<Response> {
+  const ctx = listContext(request);
+  if (ctx instanceof Response) return ctx;
+  const denied = requireOwner(ctx);
+  if (denied) return denied;
+  try {
+    await ctx.store.checkRate("read", clientIp(request));
+    await visibleList(ctx, listId);
+    const [jobs, records] = await Promise.all([
+      ctx.store.readJobs(),
+      ctx.store.readBatches(listId),
+    ]);
+    const byId = new Map(records.map((record) => [record.id, record]));
+    return json({
+      ok: true,
+      jobs: jobs.map((job) => ({
+        ...job,
+        imported: byId.get(job.id)?.imported.length ?? 0,
+      })),
+    });
+  } catch (err) {
+    return listFailure(err);
+  }
+}
+
+/** Adds one finished batch to one or more lists. */
+async function handleImportJob(request: Request): Promise<Response> {
+  const ctx = listContext(request);
+  if (ctx instanceof Response) return ctx;
+  const denied = requireOwner(ctx);
+  if (denied) return denied;
+  try {
+    await ctx.store.checkRate("import", clientIp(request));
+    const body = await jsonBody(request);
+    const jobId = typeof body.jobId === "string" ? body.jobId.trim() : "";
+    if (!isValidJobId(jobId)) throw new ListError("That batch link is not valid.", 400);
+    const listIds = Array.isArray(body.listIds)
+      ? [...new Set(body.listIds.filter((id): id is string => typeof id === "string" && id !== ""))]
+      : [];
+    if (listIds.length === 0) throw new ListError("Choose at least one list.", 400);
+    if (listIds.length > ctx.settings.maxLists) {
+      throw new ListError(`At most ${ctx.settings.maxLists} lists at once.`, 400);
+    }
+
+    const meta = await readMeta(jobId);
+    if (!meta) throw new ListError("This batch has expired or does not exist.", 404);
+    const entries = await readJobEntries(jobId);
+    if (entries.length === 0) {
+      throw new ListError("This batch has no finished reports yet.", 409);
+    }
+
+    const results: Record<string, unknown>[] = [];
+    for (const listId of listIds) {
+      try {
+        if (!isValidListId(listId)) throw new ListError("That list does not exist.", 404);
+        const { counts } = await ctx.store.importJob(listId, jobId, entries, {
+          createdAt: meta.createdAt,
+          total: meta.total,
+          firstUrl: meta.urls[0] ?? "",
+        });
+        results.push({ listId, ok: true, ...counts });
+      } catch (err) {
+        if (!(err instanceof ListError)) throw err;
+        results.push({ listId, ok: false, error: err.message });
+      }
+    }
+
+    return json({
+      ok: true,
+      batch: { total: meta.total, ready: entries.length },
+      results,
+    });
+  } catch (err) {
+    return listFailure(err);
+  }
+}
+
+/** Imports a CLI `report.json` (a plain array of reports) into lists. */
+async function handleImportReports(request: Request): Promise<Response> {
+  const ctx = listContext(request);
+  if (ctx instanceof Response) return ctx;
+  const denied = requireOwner(ctx);
+  if (denied) return denied;
+  try {
+    await ctx.store.checkRate("import", clientIp(request));
+    const body = await jsonBody(request);
+    const reports = Array.isArray(body.reports) ? body.reports : null;
+    if (!reports || reports.length === 0) {
+      throw new ListError("Send the reports from report.json.", 400);
+    }
+    if (reports.length > MAX_REPORT_IMPORTS) {
+      throw new ListError(`At most ${MAX_REPORT_IMPORTS} reports per request.`, 400);
+    }
+    const listIds = Array.isArray(body.listIds)
+      ? [...new Set(body.listIds.filter((id): id is string => typeof id === "string" && id !== ""))]
+      : [];
+    if (listIds.length === 0) throw new ListError("Choose at least one list.", 400);
+
+    const results: Record<string, unknown>[] = [];
+    for (const listId of listIds) {
+      try {
+        if (!isValidListId(listId)) throw new ListError("That list does not exist.", 404);
+        const { counts } = await ctx.store.importReports(listId, reports);
+        results.push({ listId, ok: true, ...counts });
+      } catch (err) {
+        if (!(err instanceof ListError)) throw err;
+        results.push({ listId, ok: false, error: err.message });
+      }
+    }
+    return json({ ok: true, reports: reports.length, results });
+  } catch (err) {
+    return listFailure(err);
+  }
+}
+
 /* ------------------------------------------------------------------ routing */
 
-function routeOf(url: URL): { pathname: string; jobId: string } {
+interface Route {
+  pathname: string;
+  jobId: string;
+  listId: string;
+  siteKey: string;
+}
+
+function routeParam(value: string | null): string {
+  if (!value) return "";
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function routeOf(url: URL): Route {
   const forced = url.searchParams.get("__route");
   const jobId = (url.searchParams.get("jobId") ?? "").trim();
+  const listId = routeParam(url.searchParams.get("listId"));
+  const siteKey = routeParam(url.searchParams.get("siteKey"));
+  const base = { jobId, listId, siteKey };
   switch (forced) {
     case "health":
-      return { pathname: "/health", jobId };
+      return { pathname: "/health", ...base };
     case "analyze":
-      return { pathname: "/v1/analyze", jobId };
+      return { pathname: "/v1/analyze", ...base };
     case "api":
-      return { pathname: "/v1", jobId };
+      return { pathname: "/v1", ...base };
     case "jobs":
-      return { pathname: "/v1/jobs", jobId };
+      return { pathname: "/v1/jobs", ...base };
     case "job_run":
-      return { pathname: "/v1/jobs/run", jobId };
+      return { pathname: "/v1/jobs/run", ...base };
     case "job":
-      return { pathname: `/v1/jobs/${jobId}`, jobId };
+      return { pathname: `/v1/jobs/${jobId}`, ...base };
     case "job_retry":
-      return { pathname: `/v1/jobs/${jobId}/retry`, jobId };
+      return { pathname: `/v1/jobs/${jobId}/retry`, ...base };
     case "job_report":
-      return { pathname: `/v1/jobs/${jobId}/report.json`, jobId };
+      return { pathname: `/v1/jobs/${jobId}/report.json`, ...base };
+    case "lists":
+      return { pathname: "/v1/lists", ...base };
+    case "list":
+      return { pathname: `/v1/lists/${listId}`, ...base };
+    case "lists_import":
+      return { pathname: "/v1/lists/import", ...base };
+    case "lists_reports":
+      return { pathname: "/v1/lists/reports", ...base };
+    case "list_batches":
+      return { pathname: `/v1/lists/${listId}/batches`, ...base };
+    case "list_sites":
+      return { pathname: `/v1/lists/${listId}/sites`, ...base };
+    case "list_site":
+      return { pathname: `/v1/lists/${listId}/sites/${siteKey}`, ...base };
+    case "list_bulk":
+      return { pathname: `/v1/lists/${listId}/bulk`, ...base };
+    case "list_clear":
+      return { pathname: `/v1/lists/${listId}/clear`, ...base };
+    case "list_restore":
+      return { pathname: `/v1/lists/${listId}/restore`, ...base };
+    case "list_csv":
+      return { pathname: `/v1/lists/${listId}/export.csv`, ...base };
     default:
-      return { pathname: url.pathname, jobId };
+      return { pathname: url.pathname, ...base };
   }
 }
 
@@ -570,6 +1153,14 @@ export default {
           "GET /v1/jobs/:id": "Progress and reports for one batch.",
           "POST /v1/jobs/:id/retry": "Queue the websites that are still missing.",
           "GET /v1/jobs/:id/report.json": "Download the batch as report.json.",
+          "GET /v1/lists": "The permanent lists and their site counts.",
+          "POST /v1/lists": "Create a list.",
+          "POST /v1/lists/import": "Copy a finished batch into one or more lists.",
+          "POST /v1/lists/reports": "Import reports from a CLI report.json.",
+          "GET /v1/lists/:id": "One list with a summary row per site.",
+          "GET /v1/lists/:id/sites/:key": "One site: summary, report, run history.",
+          "PATCH /v1/lists/:id/sites/:key": "Set outreach status, notes and tags.",
+          "GET /v1/lists/:id/export.csv": "Download the list as CSV.",
           "GET /health": "Key and configuration status.",
         },
       });
@@ -610,6 +1201,84 @@ export default {
         return failure("Use GET /v1/jobs/:id.", 405);
       }
       return handleGetJob(id);
+    }
+
+    /* ------------------------------------------------------------- lists */
+
+    if (pathname === "/v1/lists") {
+      if (method === "GET" || method === "HEAD") return handleListsIndex(request);
+      if (method === "POST") return handleCreateList(request);
+      return failure("Use GET or POST /v1/lists.", 405, { allow: "GET, POST" });
+    }
+
+    if (pathname === "/v1/lists/import") {
+      if (method !== "POST") return failure("Use POST /v1/lists/import.", 405, { allow: "POST" });
+      return handleImportJob(request);
+    }
+
+    if (pathname === "/v1/lists/reports") {
+      if (method !== "POST") return failure("Use POST /v1/lists/reports.", 405, { allow: "POST" });
+      return handleImportReports(request);
+    }
+
+    const listSub = /^\/v1\/lists\/([^/]+)\/(sites|batches|bulk|clear|restore|export\.csv)(?:\/(.+))?$/.exec(
+      pathname,
+    );
+    if (listSub) {
+      const listId = decodeURIComponent(listSub[1]!);
+      const kind = listSub[2]!;
+      const extra = listSub[3] ? decodeURIComponent(listSub[3]) : "";
+      if (!isValidListId(listId)) return failure("Unknown list.", 404);
+
+      if (kind === "sites") {
+        if (extra) {
+          if (method === "GET" || method === "HEAD") return handleReadSite(request, listId, extra);
+          if (method === "PATCH") return handleUpdateSite(request, listId, extra);
+          if (method === "DELETE") return handleDeleteSite(request, listId, extra);
+          return failure("Use GET, PATCH or DELETE on a site.", 405, {
+            allow: "GET, PATCH, DELETE",
+          });
+        }
+        if (method !== "POST") {
+          return failure("Use POST /v1/lists/:id/sites to read several at once.", 405, {
+            allow: "POST",
+          });
+        }
+        return handleReadSites(request, listId);
+      }
+
+      if (kind === "batches") {
+        if (method !== "GET" && method !== "HEAD") {
+          return failure("Use GET /v1/lists/:id/batches.", 405);
+        }
+        return handleListBatches(request, listId);
+      }
+
+      if (kind === "export.csv") {
+        if (method !== "GET" && method !== "HEAD") {
+          return failure("Use GET /v1/lists/:id/export.csv.", 405);
+        }
+        return handleListCsv(request, listId);
+      }
+
+      if (method !== "POST") {
+        return failure(`Use POST for /v1/lists/:id/${kind}.`, 405, { allow: "POST" });
+      }
+      if (kind === "bulk") return handleListBulk(request, listId);
+      if (kind === "clear") return handleClearList(request, listId);
+      if (kind === "restore") return handleRestoreList(request, listId);
+    }
+
+    const listOne = /^\/v1\/lists\/([^/]+)$/.exec(pathname);
+    if (listOne) {
+      const listId = decodeURIComponent(listOne[1]!);
+      if (!isValidListId(listId)) return failure("Unknown list.", 404);
+      if (method === "GET" || method === "HEAD") return handleReadList(request, listId);
+      if (method === "PATCH") return handleUpdateList(request, listId);
+      if (method === "DELETE") return handleDeleteList(request, listId);
+      return failure("Use GET, PATCH or DELETE on a list.", 405, {
+        allow: "GET, PATCH, DELETE",
+      });
     }
 
     return failure(`Unknown path ${pathname}.`, 404);

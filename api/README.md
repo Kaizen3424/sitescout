@@ -202,6 +202,77 @@ Keys appear only as a 16-character hash, so the endpoint is safe to open in a
 browser. If Redis is unreachable the quota block is omitted instead of failing
 the whole answer.
 
+## Permanent lists
+
+A batch expires after 30 days. A **list** is the part that stays: one row per
+domain, the latest full report, a short run history, and the owner's outreach
+status, notes and tags. Lists use the same Redis and the same function; they
+never touch Firecrawl, Gemini or QStash, so working with them costs no analysis
+quota.
+
+Each list has a `visibility`:
+
+| Value | Who can read it |
+|-------|-----------------|
+| `public` | Anyone with the link; it also appears on `/lists` to visitors. |
+| `unlisted` | Anyone with the link, but it is not on `/lists` for visitors. |
+| `private` | Only a request with the management key. Needs `SITESCOUT_LIST_KEY`; without that variable it cannot be used. |
+
+Writes always need the management key **when one is configured**. Reads are open
+unless the list is private, which answers `404` so it is not discoverable. With
+no `SITESCOUT_LIST_KEY`, management is `open`: the link is the secret. That is
+the intended mode for a personal, public-by-link deployment.
+
+All list endpoints accept the key in the header:
+
+```
+x-sitescout-list-key: <SITESCOUT_LIST_KEY>
+```
+
+Every answer says what the caller is allowed to do:
+
+```json
+{ "ok": true, "owner": true, "management": "open", "list": { "id": "…", "name": "…", "siteCount": 12 } }
+```
+
+`owner: false` responses omit notes, outreach status, tags, contact routes,
+batch links and the batch picker. `management` is `open`, `key` or `disabled`
+(the last one means the variable is set but shorter than 24 characters).
+
+| Endpoint | What it does |
+|----------|--------------|
+| `GET /v1/lists` | Every list the caller may see, with `siteCount`. Optional `?jobId=` adds how many of that batch each list already has. |
+| `POST /v1/lists` | `{ "name": "…", "description": "…", "visibility": "public" }` → `201`. |
+| `GET /v1/lists/:id` | The list, one summary row per site, and (for the owner) the imported batches. |
+| `PATCH /v1/lists/:id` | Rename, describe, change visibility. |
+| `DELETE /v1/lists/:id` | Delete the list and every site in it. |
+| `GET /v1/lists/:id/batches` | The batches the owner can still add, with how many reports each has in this list. |
+| `POST /v1/lists/import` | `{ "jobId": "…", "listIds": ["…"] }`: copy one finished batch into one or more lists. |
+| `POST /v1/lists/reports` | `{ "reports": [ … ], "listIds": ["…"] }`: import up to 25 reports per request (a CLI `report.json`). |
+| `GET /v1/lists/:id/sites/:key` | One site: `{ summary, report, history }`. `:key` is the host, e.g. `arngren.net`. |
+| `PATCH /v1/lists/:id/sites/:key` | `{ "status": "contacted", "notes": "…", "tags": ["…"] }`. |
+| `DELETE /v1/lists/:id/sites/:key` | Remove one site. |
+| `POST /v1/lists/:id/sites` | `{ "keys": ["…"] }` (max 40): the full details for several sites, used by the JSON backup. |
+| `POST /v1/lists/:id/bulk` | `{ "action": "status", "status": "won", "keys": ["…"] }` or `{ "action": "remove", … }` (max 500). |
+| `POST /v1/lists/:id/clear` | Remove every site, keep the list. |
+| `POST /v1/lists/:id/restore` | `{ "sites": [ … ], "batches": [ … ] }` (max 15 sites): restore a backup chunk. Existing sites are skipped. |
+| `GET /v1/lists/:id/export.csv` | CSV (BOM + CRLF, opens cleanly in Excel), owner only. |
+
+Adding a batch is always explicit. `POST /v1/jobs` only records the new batch in
+the picker (`ss:list:jobs`); it never adds anything to a list.
+
+What a merge does, in one paragraph: the newest attempt decides the verdict on
+the row, except that a failed re-check (`UNSCORED`) keeps the last good score and
+raises `attention: true`; only a scored report can replace the profile, and an
+older report never overwrites a newer one; every new run is counted and appears
+in the history (deduplicated by batch + index, newest first, 15 kept by default);
+a site is identified by the host of its final URL without `www.`, so different
+paths or schemes collapse into one row while subdomains stay separate.
+
+Batches stay disposable: once the 30-day TTL removes one, its reports in a list
+are untouched. The history keeps a short link to the batch, which answers `404`
+after that.
+
 ## How a batch runs
 
 1. `POST /v1/jobs` checks the quota counters, normalises the URLs and writes one
@@ -272,6 +343,17 @@ budget is the second line of defence.
 | `ss:cache:<hash>` | string | cached Decisions answers (72 h) |
 | `ss:rate:job:<ip-hash>:<hour>` | counter | batches per address per hour |
 | `ss:rate:urls:<date>` | counter | URLs analysed today (UTC) |
+| `ss:list:registry` | hash | field `<listId>` → list name, description, visibility, timestamps |
+| `ss:list:jobs` | hash | recent batches for the “Add a batch” picker (200 kept) |
+| `ss:list:<id>:summaries` | hash | field `<host>` → one summary row |
+| `ss:list:<id>:reports` | hash | field `<host>` → the latest full report |
+| `ss:list:<id>:history` | hash | field `<host>` → JSON array of the last runs |
+| `ss:list:<id>:batches` | hash | which batch was imported, and how much of it |
+| `ss:list:lock` | string | `SET NX PX 30s`, one import at a time |
+| `ss:list:rate:<kind>:<ip-hash>:<hour>` | counter | list reads/imports/writes per address |
+
+List data has no TTL; deleting a list removes its four hashes. The caps below
+are what keep it inside the free 250 MB.
 
 `<scope>` is either `global` (all keys together) or a key hash. Addresses and
 keys are stored as a 16-character SHA-256 prefix, never raw:
@@ -316,6 +398,14 @@ keys are stored as a 16-character SHA-256 prefix, never raw:
 | `SITESCOUT_QUOTA_RETRY_BASE_MS` | no | `120000` | First delay before a quota-blocked URL is retried; doubles per attempt. |
 | `SITESCOUT_QUOTA_MAX_ATTEMPTS` | no | `5` | Quota deferrals before a URL is reported as unscored (daily limits: 2). |
 | `SITESCOUT_JOBS_INLINE` | no | off | Development only: run the batch inside the request, no QStash. |
+| `SITESCOUT_LIST_KEY` | no | — | Management key for list changes. Empty = open (link is the secret); under 24 characters = management disabled. |
+| `SITESCOUT_LISTS_MAX` | no | `20` | Maximum number of lists. |
+| `SITESCOUT_LIST_MAX_SITES` | no | `2000` | Maximum sites in one list. |
+| `SITESCOUT_LISTS_MAX_SITES` | no | `5000` | Maximum site entries across every list. |
+| `SITESCOUT_LIST_HISTORY_RUNS` | no | `15` | Runs kept per site (the total is still counted). |
+| `SITESCOUT_LIST_READS_PER_HOUR` | no | `600` | List reads per address per hour. |
+| `SITESCOUT_LIST_IMPORTS_PER_HOUR` | no | `60` | List imports per address per hour. |
+| `SITESCOUT_LIST_WRITES_PER_HOUR` | no | `300` | List edits per address per hour. |
 
 Leave the four `SITESCOUT_GEMINI_*` budgets alone unless your Google plan is
 bigger than the free tier: the free tier of the decision model allows 50,000
@@ -347,7 +437,12 @@ the POST returns when the whole batch is done. Keep test batches to one or two
 URLs: the request still has Vercel's time budget.
 
 The page itself is static (`web/index.html`, `web/styles.css`, `web/app.js`);
-`vercel.json` maps `/` and `/j/:id` to it.
+`vercel.json` maps `/`, `/j/:id`, `/lists` and `/l/:id` to it. Lists work
+locally without QStash, because they never queue analysis.
+
+If `vercel dev` answers `Missing Upstash Redis configuration` while `.env.local`
+does exist, the CLI is not loading that file: set the variables in the shell
+before starting it, or run `vercel env pull .env.local` and start again.
 
 Call the token endpoint:
 
@@ -370,7 +465,8 @@ curl.exe -X POST http://localhost:3000/v1/analyze `
      `QSTASH_NEXT_SIGNING_KEY`, and `QSTASH_URL` if the region is not the
      default.
 4. Add `FIRECRAWL_API_KEYS`, `GEMINI_API_KEYS` and `SITESCOUT_API_TOKEN` the same
-   way.
+   way. Lists work without further setup; add `SITESCOUT_LIST_KEY` only if you
+   want changes protected and private lists available.
 5. `vercel --prod`.
 
 No cron job is involved: QStash delivers the work, so Hobby's once-a-day cron

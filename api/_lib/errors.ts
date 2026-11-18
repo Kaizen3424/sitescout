@@ -9,6 +9,21 @@ export class SiteScoutError extends Error {
 
 export class ConfigError extends SiteScoutError {}
 
+/**
+ * A request about a permanent list that should be answered with `status`
+ * instead of a generic 500. The message is written for the page, not a log.
+ */
+export class ListError extends SiteScoutError {
+  readonly status: number;
+  readonly extra: Record<string, unknown>;
+
+  constructor(message: string, status = 400, extra: Record<string, unknown> = {}) {
+    super(message);
+    this.status = status;
+    this.extra = extra;
+  }
+}
+
 export class InvalidUrlError extends SiteScoutError {}
 
 export class NetworkError extends SiteScoutError {}

@@ -67,6 +67,37 @@ background queue). Setup is in [`api/README.md`](api/README.md#deploy).
 
 ---
 
+## Lists: what you keep
+
+A batch is one run. It disappears after 30 days, which is fine for a quick check
+but useless for outreach: you need to remember that you emailed a bakery in March
+and that their site got worse in May.
+
+**Lists** are that memory. They live on the same free Redis, have no expiry, and
+hold one row per domain:
+
+- the latest full report, plus the last 15 checks as a small history;
+- an outreach status per site (`new`, `contacted`, `follow up`, `won`, `no`);
+- notes and up to 10 tags per site;
+- filter and sort over the whole list, and a CSV download for a spreadsheet.
+
+Nothing enters a list by itself. Open a finished batch, press **Add to list**,
+pick one or more lists. A report file from the command line tool can be imported
+the same way, and **Backup** writes the whole list to one JSON file that
+**Import** can restore.
+
+There is still **no login**. A list is readable by anyone who has its link; the
+lists page itself is not indexed by search engines. If you want more than that,
+set `SITESCOUT_LIST_KEY` and private lists ask for it before they open. Without
+that variable the whole thing stays open, which is the intended mode for a
+personal tool.
+
+The free-tier caps are 20 lists, 2,000 sites per list and 5,000 entries in total.
+Each site costs one Redis hash field; the JSON backup is the safety net if a list
+is ever deleted by mistake.
+
+---
+
 ## HTTP API (optional)
 
 There is also a TypeScript API in `api/`, made for Vercel. It runs the same
