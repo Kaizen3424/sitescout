@@ -8,7 +8,7 @@ For every URL you get one of five verdicts:
 |--------------|-------------------------------------------------------------------------|
 | `REACH_OUT`  | Clear redesign opportunity - worth contacting.                          |
 | `MAYBE`      | Borderline: decent but improvable, or one signal is uncertain.          |
-| `SKIP`       | Looks fine (or it is a large company / chain, which you don't target).  |
+| `SKIP`       | Looks fine: redesign need is below the low threshold.                  |
 | `SITE_DOWN`  | The site does not load / is unreachable.                                |
 | `UNSCORED`   | No result this time (quota, blocked capture, broken screenshot).        |
 
@@ -111,8 +111,9 @@ curl.exe -X POST https://your-project.vercel.app/v1/analyze `
   -d '{"urls":["arngren.net"]}'
 ```
 
-Unlike the CLI, the API sends the full-page screenshot untouched: no crop, no
-resize, no upload budget. See [`api/README.md`](api/README.md) for the endpoint
+Unlike the CLI, the API sends the screenshots untouched: no crop, no resize, no
+upload budget. The CLI compresses each of the three frames a little so the
+upload stays small. See [`api/README.md`](api/README.md) for the endpoint
 contract, environment variables and deploy steps.
 
 The API has two doors:
@@ -132,7 +133,7 @@ The API has two doors:
 REACH_OUT need 0.85  vis  1.1/10  https://arngren.net/  - the design looks dated or unappealing at first glance
 ```
 
-- **need** = redesign need, 0 to 1. `0.60` and above is `REACH_OUT`, `0.40-0.60` is `MAYBE`.
+- **need** = redesign need, 0 to 1. `0.20` and above is `REACH_OUT`, `0.10-0.20` is `MAYBE`. Fitted to the owner's own ratings; see `calibration/results.json`.
 - **vis** = visual appeal, 0 to 10. It is the first of the three grades and drives 60% of the score.
 - Everything after the `-` is the main reason or the strongest talking point.
 
@@ -147,18 +148,19 @@ Useful flags:
 | `--rank`        | After a batch, sort the results by redesign need (highest first). |
 | `--out FILE`    | Write the report somewhere else (default `report.json`).         |
 | `--no-save`     | Do not write a report file.                                      |
-| `--calibrate CSV` | Score a CSV of `url,label` (`reach_out`/`skip`) to check accuracy. |
+| `--calibrate CSV` | Score a CSV of `url,rating` (`bad`/`ok`/`good`) and fit the thresholds. |
 | `-v`            | Show what is happening (cache hits, key rotation, waits).        |
 
 ---
 
 ## How a verdict is made
 
-1. **Firecrawl** makes one full-page screenshot of the homepage and returns the HTML.
+1. **Firecrawl** returns the HTML plus three 1440×900 screenshots (first screen,
+   middle and bottom) in one scrape.
 2. **Gemini Decisions** answers three small, focused sets of questions about the screenshot:
    - the three design grades (visual appeal, navigation, professional look),
    - the design verdict (outdated? unprofessional? which era?),
-   - page checks (broken/blank, placeholder, small local business, popup, category).
+   - page checks (broken/blank, placeholder, company size as a warning, popup, category).
 3. **HTML checks** add hard technical signals: no HTTPS, no mobile viewport, old
    jQuery/Bootstrap, table layout, stale copyright year, etc.
 4. The redesign need is **60% visual appeal + 20% navigation + 20% professional
@@ -222,8 +224,8 @@ $env:SITESCOUT_UPLOAD_BUDGET_KB = "600"
 Tune the thresholds (defaults in brackets):
 
 ```powershell
-$env:SITESCOUT_REACH_OUT_THRESHOLD = "0.55"   # default 0.60
-$env:SITESCOUT_MAYBE_THRESHOLD = "0.35"       # default 0.40
+$env:SITESCOUT_REACH_OUT_THRESHOLD = "0.25"   # default 0.20
+$env:SITESCOUT_MAYBE_THRESHOLD = "0.15"       # default 0.10
 ```
 
 **A site is blocked by bot protection**
@@ -240,8 +242,10 @@ change is final, port it to `api/` and deploy.
 |-----------------------|-------------------------------------------------------------|
 | `cli/sitescout.py`    | Start here - thin launcher.                                 |
 | `cli/cli.py`          | Command line, batch/interactive runs, calibration.          |
-| `cli/capture.py`      | Firecrawl scrape + screenshot cache.                        |
-| `cli/decisions.py`    | Gemini questions, screenshot shrinking, answer cache.       |
+| `cli/capture.py`      | Firecrawl scrape (three frames) + capture cache.             |
+| `cli/decisions.py`    | Gemini questions, frame shrinking, answer cache.             |
+| `cli/review.py`       | Local web app: view the screenshots and rate 20 sites.        |
+| `cli/calibrate.py`    | Fit the two thresholds to your own bad/ok/good ratings.      |
 | `cli/scoring.py`      | Three grades, need score, confidence, talking points.       |
 | `cli/htmlchecks.py`   | Technical checks on the HTML and contact details.           |
 | `cli/reporting.py`    | One-line output, full report, `report.json`.                |

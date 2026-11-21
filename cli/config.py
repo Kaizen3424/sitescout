@@ -50,8 +50,9 @@ class Config:
     image_resolution: str = "high"  # low | medium | high | ultra_high
     max_shot_height: int = 6000  # px; taller pages are cropped (needs Pillow)
     upload_budget_kb: float = 300.0  # keep the uploaded image under ~this many kB
-    reach_out_threshold: float = 0.60
-    maybe_threshold: float = 0.40
+    # Fitted to the owner's own bad/ok/good ratings (calibration/results.json).
+    reach_out_threshold: float = 0.20
+    maybe_threshold: float = 0.10
     min_confidence: float = 0.55
     cache_ttl_hours: float = 12.0
     decision_cache_ttl_hours: float = 72.0  # re-runs within this window reuse Gemini answers
@@ -182,8 +183,8 @@ def load_config(args: argparse.Namespace) -> Config:
         image_resolution=resolution,
         max_shot_height=_env_num("SITESCOUT_MAX_SHOT_HEIGHT", 6000, int),
         upload_budget_kb=_env_num("SITESCOUT_UPLOAD_BUDGET_KB", 300.0),
-        reach_out_threshold=_env_num("SITESCOUT_REACH_OUT_THRESHOLD", 0.60),
-        maybe_threshold=_env_num("SITESCOUT_MAYBE_THRESHOLD", 0.40),
+        reach_out_threshold=_env_num("SITESCOUT_REACH_OUT_THRESHOLD", 0.20),
+        maybe_threshold=_env_num("SITESCOUT_MAYBE_THRESHOLD", 0.10),
         min_confidence=_env_num("SITESCOUT_MIN_CONFIDENCE", 0.55),
         cache_ttl_hours=_env_num("SITESCOUT_CACHE_TTL_HOURS", 12.0),
         decision_cache_ttl_hours=_env_num("SITESCOUT_DECISION_CACHE_TTL_HOURS", 72.0),

@@ -104,25 +104,26 @@ def evaluate(cfg, m: dict, signals: dict) -> dict:
     reasons: list[str] = []
     warnings: list[str] = []
 
+    # One rounded value for both the report field and the sentence, so the
+    # headline and the reason can never disagree (0.15 vs 0.16 looked arbitrary).
+    need_shown = round(need, 3)
+
     if p_broken > 0.70:
         verdict = "UNSCORED"
         reasons.append(f"The screenshot looks blank/blocked/failed (P={p_broken:.2f}); the design can't be judged. "
                        "Try --fresh, raise SITESCOUT_WAIT_MS, or open the site manually.")
-    elif p_local < 0.25:
-        verdict = "SKIP"
-        reasons.append(f"Looks like a large company, chain or institution rather than a small local business "
-                       f"(P(small local)={p_local:.2f}).")
     else:
         if need >= cfg.reach_out_threshold:
             verdict = "REACH_OUT"
-            reasons.append(f"Redesign need {need:.2f} is above the reach-out threshold ({cfg.reach_out_threshold:.2f}).")
+            reasons.append(f"Redesign need {need_shown:.2f} is above the reach-out threshold "
+                           f"({cfg.reach_out_threshold:.2f}).")
         elif need >= cfg.maybe_threshold:
             verdict = "MAYBE"
-            reasons.append(f"Redesign need {need:.2f} is between the thresholds ({cfg.maybe_threshold:.2f}-"
+            reasons.append(f"Redesign need {need_shown:.2f} is between the thresholds ({cfg.maybe_threshold:.2f}-"
                            f"{cfg.reach_out_threshold:.2f}): decent but improvable.")
         else:
             verdict = "SKIP"
-            reasons.append(f"Redesign need {need:.2f} is low: the site looks acceptable.")
+            reasons.append(f"Redesign need {need_shown:.2f} is low: the site looks acceptable.")
             if signals.get("available") and need_signals >= 0.5:
                 verdict = "MAYBE"
                 reasons.append("It looks fine visually but the technical checks are poor (mobile/HTTPS/legacy code): "
@@ -131,10 +132,6 @@ def evaluate(cfg, m: dict, signals: dict) -> dict:
             if p_place > 0.70:
                 verdict = "MAYBE"
                 reasons.append("It looks like a placeholder/'coming soon' page: pitch a new site, not a redesign.")
-            if p_local < 0.50:
-                verdict = "MAYBE"
-                reasons.append(f"Unsure it's a small local business (P={p_local:.2f}); check the owner is reachable "
-                               "and independent.")
             if confidence < cfg.min_confidence:
                 verdict = "MAYBE"
                 reasons.append(f"The model is unsure (median confidence {confidence:.2f} < {cfg.min_confidence:.2f}); "
@@ -143,6 +140,9 @@ def evaluate(cfg, m: dict, signals: dict) -> dict:
                 verdict = "MAYBE"
                 reasons.append(f"A popup/cookie banner covers much of the page (P={p_overlay:.2f}); the score may be "
                                "unreliable.")
+    if p_local < 0.25 and verdict != "UNSCORED":
+        warnings.append(f"The model thinks this is a large company or institution (P(small local)={p_local:.2f}); "
+                        "check who owns it before pitching.")
     if p_overlay > 0.60 and verdict != "UNSCORED":
         warnings.append("A popup/overlay seems to cover part of the page; scores may be less reliable.")
     if p_place > 0.70 and verdict != "UNSCORED":

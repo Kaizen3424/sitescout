@@ -33,7 +33,8 @@ export interface Capture {
   html: string;
   title: string;
   siteName: string;
-  image: Buffer;
+  /** First screen, middle and bottom of the page, in that order. */
+  images: Buffer[];
   fetchedAt: number;
 }
 

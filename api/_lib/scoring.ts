@@ -185,29 +185,25 @@ export function evaluate(settings: Settings, model: ParsedAnswers, signals: Html
       `The screenshot looks blank/blocked/failed (P=${pBroken.toFixed(2)}); the design can't be judged. ` +
         "Try fresh=true, raise SITESCOUT_WAIT_MS, or open the site manually.",
     );
-  } else if (pLocal < 0.25) {
-    verdict = "SKIP";
-    reasons.push(
-      `Looks like a large company, chain or institution rather than a small local business ` +
-        `(P(small local)=${pLocal.toFixed(2)}).`,
-    );
   } else {
+    // Same rounded value as need_score, so the headline and the reason agree.
+    const needShown = round3(need).toFixed(2);
     if (need >= settings.reachOutThreshold) {
       verdict = "REACH_OUT";
       reasons.push(
-        `Redesign need ${need.toFixed(2)} is above the reach-out threshold ` +
+        `Redesign need ${needShown} is above the reach-out threshold ` +
           `(${settings.reachOutThreshold.toFixed(2)}).`,
       );
     } else if (need >= settings.maybeThreshold) {
       verdict = "MAYBE";
       reasons.push(
-        `Redesign need ${need.toFixed(2)} is between the thresholds ` +
+        `Redesign need ${needShown} is between the thresholds ` +
           `(${settings.maybeThreshold.toFixed(2)}-${settings.reachOutThreshold.toFixed(2)}): ` +
           "decent but improvable.",
       );
     } else {
       verdict = "SKIP";
-      reasons.push(`Redesign need ${need.toFixed(2)} is low: the site looks acceptable.`);
+      reasons.push(`Redesign need ${needShown} is low: the site looks acceptable.`);
       if (signals.available && needSignals >= 0.5) {
         verdict = "MAYBE";
         reasons.push(
@@ -221,13 +217,6 @@ export function evaluate(settings: Settings, model: ParsedAnswers, signals: Html
       if (pPlace > 0.7) {
         verdict = "MAYBE";
         reasons.push("It looks like a placeholder/'coming soon' page: pitch a new site, not a redesign.");
-      }
-      if (pLocal < 0.5) {
-        verdict = "MAYBE";
-        reasons.push(
-          `Unsure it's a small local business (P=${pLocal.toFixed(2)}); check the owner is reachable ` +
-            "and independent.",
-        );
       }
       if (confidence < settings.minConfidence) {
         verdict = "MAYBE";
@@ -246,6 +235,12 @@ export function evaluate(settings: Settings, model: ParsedAnswers, signals: Html
     }
   }
 
+  if (pLocal < 0.25 && verdict !== "UNSCORED") {
+    warnings.push(
+      `The model thinks this is a large company or institution (P(small local)=${pLocal.toFixed(2)}); ` +
+        "check who owns it before pitching.",
+    );
+  }
   if (pOverlay > 0.6 && verdict !== "UNSCORED") {
     warnings.push("A popup/overlay seems to cover part of the page; scores may be less reliable.");
   }

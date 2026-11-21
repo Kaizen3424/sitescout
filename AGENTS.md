@@ -32,8 +32,13 @@ index at `/v1`. Deployed from the `main` branch of
 
 ## Rules that must not be broken
 
-- **One full-page screenshot, untouched.** No crop, no resize, no upload budget in
-  the API. Only Google's 20 MB inline limit is enforced (above it: `UNSCORED`).
+- **Three viewport-sized frames, untouched.** One Firecrawl scrape returns the
+  first screen, the middle and the bottom as 1440×900 screenshots. No crop, no
+  resize, no upload budget in the API. Only Google's 20 MB inline limit per image
+  is enforced (above it: `UNSCORED`). All three go to the design call; only the
+  first goes to verdict/page. Never go back to a full-page strip: Firecrawl's
+  100,000 px viewport breaks scroll-animated layouts, and the downscaled strip
+  made the scores inconsistent.
 - **Three separate Gemini Decisions calls** per site (design / verdict / page).
   Never merge them into one call.
 - **API keys come from the environment only**: `.env` for the CLI, `.env.local`

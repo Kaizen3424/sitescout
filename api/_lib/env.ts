@@ -105,8 +105,9 @@ export function loadSettings(): Settings {
     httpRetries: envNumber("SITESCOUT_HTTP_RETRIES", 3),
     backoffBase: envNumber("SITESCOUT_BACKOFF_BASE", 1.5),
     imageResolution: readResolution(),
-    reachOutThreshold: envNumber("SITESCOUT_REACH_OUT_THRESHOLD", 0.6),
-    maybeThreshold: envNumber("SITESCOUT_MAYBE_THRESHOLD", 0.4),
+    // Fitted to the owner's own bad/ok/good ratings (calibration/results.json).
+    reachOutThreshold: envNumber("SITESCOUT_REACH_OUT_THRESHOLD", 0.2),
+    maybeThreshold: envNumber("SITESCOUT_MAYBE_THRESHOLD", 0.1),
     minConfidence: envNumber("SITESCOUT_MIN_CONFIDENCE", 0.55),
     decisionCacheTtlHours: envNumber("SITESCOUT_DECISION_CACHE_TTL_HOURS", 72),
     maxUrls: Math.max(1, Math.min(envNumber("SITESCOUT_MAX_URLS", 5), 10)),

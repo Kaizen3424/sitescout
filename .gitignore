@@ -17,6 +17,9 @@ node_modules/
 report.json
 report_*.json
 
+# Calibration labels: opinions about named businesses, never committed
+calibration/
+
 # Backups (the old monolith contained a key)
 *.bak
 

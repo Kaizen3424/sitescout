@@ -583,11 +583,13 @@ export const IMAGE_TOKENS: Record<string, number> = {
 export function estimateInputTokens(options: {
   textChars: number;
   resolution: string;
+  /** How many images one call carries (the design call sends three). */
+  imageCount?: number;
   observed?: number | null;
 }): number {
   const image = IMAGE_TOKENS[options.resolution] ?? IMAGE_TOKENS.high!;
   const text = Math.ceil(options.textChars / 3);
-  const raw = text + image;
+  const raw = text + image * Math.max(1, options.imageCount ?? 1);
   const observed = Number(options.observed ?? 0);
   return Math.max(raw, Number.isFinite(observed) ? observed : 0);
 }

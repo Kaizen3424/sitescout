@@ -168,9 +168,10 @@ test("low need is a skip", () => {
   assert.equal(result.verdict, "SKIP");
 });
 
-test("a large company is skipped even with a poor site", () => {
+test("a large company is still judged on its design, with a warning", () => {
   const result = evaluate(CFG, model(choices("poor", "lost", "amateur"), 0.05), NO_SIGNALS);
-  assert.equal(result.verdict, "SKIP");
+  assert.equal(result.verdict, "REACH_OUT");
+  assert.ok(result.warnings.some((w) => w.includes("large company")));
 });
 
 test("the report exposes all three grades", () => {

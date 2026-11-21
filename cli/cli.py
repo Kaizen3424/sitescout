@@ -3,7 +3,6 @@ runs and calibration."""
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import logging
 import os
@@ -61,7 +60,7 @@ def analyze(url_in: str, cfg: Config, session: requests.Session, fresh: bool = F
     report["contact"] = signals.get("contact", {})
 
     try:
-        model_out = run_decisions(session, cfg, cap.image_bytes, fresh=fresh)
+        model_out = run_decisions(session, cfg, cap.frames, fresh=fresh)
         report["image"] = model_out.get("image")
     except (CaptureError, DecisionError) as exc:
         report["reasons"].append(f"Could not score the design: {exc}")
@@ -103,46 +102,10 @@ def _process_one(url: str, cfg: Config, args: argparse.Namespace) -> dict:
 # Calibration against your own labels
 # ============================================================================
 def run_calibration(path: Path, cfg: Config, fresh: bool) -> int:
-    try:
-        with path.open(newline="", encoding="utf-8-sig") as fh:
-            rows = [(r.get("url", "").strip(), r.get("label", "").strip().lower()) for r in csv.DictReader(fh)]
-    except OSError as exc:
-        print(f"Cannot read {path}: {exc}", file=sys.stderr)
-        return 2
-    rows = [(u, l) for u, l in rows if u and l in ("reach_out", "skip")]
-    if not rows:
-        print("No usable rows. CSV needs columns: url,label (label = reach_out or skip).", file=sys.stderr)
-        return 2
-    session = _new_session()
-    exact = soft = wrong = failed = 0
-    print(f"{'label':<10} {'verdict':<10} {'need':>5}  url")
-    for url, label in rows:
-        try:
-            r = analyze(url, cfg, session, fresh)
-        except FatalAPIError as exc:
-            print(f"Fatal: {exc}", file=sys.stderr)
-            return 3
-        except SiteScoutError as exc:
-            print(f"{label:<10} {'ERROR':<10} {'':>5}  {url}  ({exc})")
-            failed += 1
-            continue
-        v = r["verdict"]
-        want = "REACH_OUT" if label == "reach_out" else "SKIP"
-        if v == want:
-            exact += 1
-        elif v == "MAYBE":
-            soft += 1
-        elif v in ("UNSCORED", "SITE_DOWN"):
-            failed += 1
-        else:
-            wrong += 1
-        print(f"{label:<10} {v:<10} {r.get('need_score', float('nan')):>5.2f}  {url}")
-        time.sleep(cfg.batch_delay)
-    total = len(rows)
-    print(f"\nExact agreement: {exact}/{total} | borderline (MAYBE): {soft} | disagreements: {wrong} | "
-          f"unscored/errors: {failed}")
-    print("Tune SITESCOUT_REACH_OUT_THRESHOLD / SITESCOUT_MAYBE_THRESHOLD until the disagreements disappear.")
-    return 0
+    """Fit the thresholds to your own bad/ok/good labels (see calibrate.py)."""
+    from calibrate import run_calibration as fit_thresholds  # lazy: only needed for --calibrate
+
+    return fit_thresholds(path, cfg, fresh)
 
 
 # ============================================================================
@@ -170,7 +133,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-save", action="store_true", help="don't write the report.json file")
     p.add_argument("--out", default="report.json",
                    help="file to save all results to, as JSON (default: report.json)")
-    p.add_argument("--calibrate", metavar="CSV", help="CSV (url,label) of sites you've labelled reach_out/skip")
+    p.add_argument("--calibrate", metavar="CSV",
+                   help="CSV (url,rating) of sites you've labelled bad/ok/good; fits the thresholds")
     p.add_argument("--no-color", action="store_true")
     p.add_argument("-v", "--verbose", action="store_true")
     return p

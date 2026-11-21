@@ -4,7 +4,7 @@ SiteScout - paste a business website URL, get a verdict on whether it is worth
 pitching a redesign to the owner.
 
 Pipeline
-  1. Firecrawl  POST /v2/scrape  -> rawHtml + ONE full-page screenshot
+  1. Firecrawl  POST /v2/scrape  -> rawHtml + THREE 1440x900 frames of each page
   2. Rule-based HTML checks     -> HTTPS, mobile viewport tag, stale (c) year,
                                    legacy tech, contact details
   3. Decision model             -> calibrated yes/no and choice answers
@@ -36,7 +36,8 @@ Usage
   python sitescout.py -f urls.txt --rank              # batch, sorted by redesign need
   python sitescout.py URL1 URL2 URL3 -w 4             # 4 parallel workers (default 2)
   python sitescout.py URL --full                      # batch mode with the full report per URL
-  python sitescout.py --calibrate labels.csv          # CSV with columns: url,label (reach_out|skip)
+  python sitescout.py --calibrate ratings.csv         # CSV with url,rating (bad|ok|good); fits thresholds
+  python cli/calibrate.py ratings.csv                 # the same, with a threshold sweep and hold-out check
   python sitescout.py URL --json                      # machine-readable output
   python sitescout.py URL --fresh                     # ignore all caches and start over
   python sitescout.py URL --out myresults.json        # where to save the report

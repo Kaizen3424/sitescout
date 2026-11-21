@@ -54,7 +54,7 @@ the same field names as the CLI's `report.json`:
         "navigation": { "score_0_to_10": 5.0, "confidence": 0.84, "grade": "workable", "label": "Workable" },
         "credibility": { "score_0_to_10": 2.0, "confidence": 0.88, "grade": "weak", "label": "Weak" }
       },
-      "reasons": ["Redesign need 0.79 is above the reach-out threshold (0.60)."],
+      "reasons": ["Redesign need 0.79 is above the reach-out threshold (0.20)."],
       "issues": [{ "label": "...", "phrase": "...", "severity": 0.9 }]
     }
   ],
@@ -374,8 +374,8 @@ keys are stored as a 16-character SHA-256 prefix, never raw:
 | `SITESCOUT_CONCURRENCY` | no | `3` | URLs analysed in parallel per request. |
 | `SITESCOUT_MODEL` | no | `gemini-decision-1` | Decisions model. |
 | `SITESCOUT_IMAGE_RESOLUTION` | no | `high` | Gemini's own image setting (`low`/`medium`/`high`/`ultra_high`). |
-| `SITESCOUT_REACH_OUT_THRESHOLD` | no | `0.60` | Verdict threshold. |
-| `SITESCOUT_MAYBE_THRESHOLD` | no | `0.40` | Verdict threshold. |
+| `SITESCOUT_REACH_OUT_THRESHOLD` | no | `0.20` | Verdict threshold (fitted to the owner's ratings). |
+| `SITESCOUT_MAYBE_THRESHOLD` | no | `0.10` | Verdict threshold (fitted to the owner's ratings). |
 | `SITESCOUT_REQUEST_DEADLINE_MS` | no | `270000` | Internal stop before Vercel's 300 s limit. |
 | `SITESCOUT_MAX_IMAGE_BYTES` | no | `18874368` | Safety stop below Google's 20 MB inline limit. |
 | `UPSTASH_REDIS_REST_URL` | jobs | — | Upstash Redis REST URL (`KV_REST_API_URL` also works). |
@@ -412,8 +412,8 @@ bigger than the free tier: the free tier of the decision model allows 50,000
 input tokens and 200 requests per minute per Cloud project, and the defaults sit
 just below that.
 
-The image itself is **never** cropped, resized or recompressed. The size in the
-report is the full-page capture from Firecrawl.
+The frames themselves are **never** cropped, resized or recompressed. The size
+in the report describes the first frame (the first screen) from Firecrawl.
 
 ## Local development
 

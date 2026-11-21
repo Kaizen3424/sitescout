@@ -72,7 +72,9 @@ export async function analyzeUrl(
   report.signals = signals;
   report.contact = signals.contact;
 
-  const imageInfo = describeImage(capture.image);
+  // The report describes the first frame only, as before; the other frames are
+  // still sent to the design call, they just aren't saved anywhere.
+  const imageInfo = describeImage(capture.images[0]!);
   report.image = { ...imageInfo, resize: "none", crop: "none" };
 
   const pageKey = `${capture.finalUrl}\n${createHash("sha1").update(capture.html).digest("hex")}`;
@@ -82,7 +84,7 @@ export async function analyzeUrl(
       settings,
       pool: deps.gemini,
       quota: deps.quota,
-      image: capture.image,
+      images: capture.images,
       mime: imageInfo.mime,
       pageKey,
       fresh: opts.fresh,
